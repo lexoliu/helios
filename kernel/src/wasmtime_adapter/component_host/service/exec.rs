@@ -2028,13 +2028,16 @@ pub(super) fn map_artifact_profile_error(error: ArtifactProfileError) -> Program
     }
 }
 
-pub(super) fn trusted_bootfs_payload(bytes: &BootfsBytes) -> Result<Bytes, ProgramExecError> {
-    let trusted = cwasm::trust_bootfs_artifact(bytes).map_err(map_artifact_trust_error)?;
-    Ok(bytes.to_bytes().slice(..trusted.payload().len()))
+pub(super) fn trusted_bootfs_payload(bytes: &BootfsBytes) -> Bytes {
+    let trusted = cwasm::trust_bootfs_artifact(bytes);
+    bytes.to_bytes().slice(..trusted.payload().len())
 }
 
-pub(super) fn trusted_signed_payload(bytes: &Bytes) -> Result<Bytes, ProgramExecError> {
-    let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes))
+pub(super) fn trusted_signed_payload(
+    bytes: &Bytes,
+    signer: &crate::CwasmSigningKey,
+) -> Result<Bytes, ProgramExecError> {
+    let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes), signer)
         .map_err(map_artifact_trust_error)?;
     Ok(bytes.slice(..trusted.payload().len()))
 }

@@ -20,6 +20,7 @@ helios-artifact.workspace = true
 helios-hal.workspace = true
 helios-kernel = { workspace = true, default-features = false, features = ["wasmtime-bare-metal"] }
 helios-virtio.workspace = true
+helios-tpm.workspace = true
 limine = "0.6.5"
 spin = "0.12.3"
 thiserror = { version = "2.0.20", default-features = false }

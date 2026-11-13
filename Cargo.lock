@@ -531,6 +531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -727,6 +728,12 @@ checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
 dependencies = [
  "error-code",
 ]
+
+[[package]]
+name = "cmov"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "cobs"
@@ -1183,6 +1190,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctutils"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
+dependencies = [
+ "cmov",
+]
+
+[[package]]
 name = "curve25519-dalek"
 version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1312,6 +1328,8 @@ checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
  "crypto-common 0.2.2",
+ "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -1341,7 +1359,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1506,7 +1524,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1954,6 +1972,7 @@ dependencies = [
  "helios-artifact",
  "helios-hal",
  "helios-kernel",
+ "helios-tpm",
  "helios-virtio",
  "limine 0.6.5",
  "spin 0.12.3",
@@ -1997,6 +2016,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde-big-array",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
 ]
 
@@ -2040,7 +2060,6 @@ dependencies = [
  "helios-profdata",
  "helios-venus-gen",
  "helios-workspace-root",
- "hex",
  "mbrman",
  "object",
  "rand 0.10.2",
@@ -2182,6 +2201,7 @@ dependencies = [
  "strength_reduce",
  "thiserror 2.0.21",
  "triomphe",
+ "zeroize",
 ]
 
 [[package]]
@@ -2313,6 +2333,7 @@ dependencies = [
  "critical-section",
  "crossbeam-utils",
  "divan",
+ "ed25519-dalek",
  "erofs-rs",
  "event-listener",
  "frame-alloc",
@@ -2324,13 +2345,15 @@ dependencies = [
  "helios-compiler-abi",
  "helios-hal",
  "helios-netstack",
+ "hkdf",
+ "hmac",
  "lru 0.16.4",
  "nu-ansi-term",
  "objectpool",
  "pin-project-lite",
  "rand_chacha",
  "rand_core 0.6.4",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "slab",
  "smallvec",
  "spin 0.9.9",
@@ -2344,6 +2367,7 @@ dependencies = [
  "wasmparser 0.245.1",
  "wasmtime",
  "wasmtime-wasi-io",
+ "zeroize",
  "zrip",
 ]
 
@@ -2447,6 +2471,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "helios-tpm"
+version = "0.1.0"
+dependencies = [
+ "helios-hal",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tpm2-protocol",
+ "zeroize",
+]
+
+[[package]]
 name = "helios-venus"
 version = "0.1.0"
 dependencies = [
@@ -2519,6 +2557,7 @@ dependencies = [
  "helios-artifact",
  "helios-hal",
  "helios-kernel",
+ "helios-tpm",
  "helios-virtio",
  "i6300esb",
  "libm",
@@ -2541,6 +2580,9 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "hickory-net"
@@ -2608,6 +2650,24 @@ dependencies = [
  "system-configuration",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3579,7 +3639,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4447,7 +4507,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4503,7 +4563,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5081,7 +5141,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5113,7 +5173,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5347,6 +5407,12 @@ name = "tower-service"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
+
+[[package]]
+name = "tpm2-protocol"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "492aa0f6c41f20a0f391bf9d8844b1e3db1b078cd63ebf333c8a5c9e9b1479a5"
 
 [[package]]
 name = "tracing"
@@ -6197,7 +6263,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6722,9 +6788,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zerotrie"

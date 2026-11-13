@@ -48,8 +48,8 @@ pub(crate) fn has_vsock_device(platform: &PlatformDescription) -> bool {
 
 /// Brings up the vsock device and publishes it as the machine's host
 /// link.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     cpu: &crate::Aarch64Cpu,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
@@ -58,6 +58,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<VsockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let vsock = discover_vsock_device(platform, physical_memory_offset, handoff)?;
     let service = helios_kernel::install_vsock_device(kernel, cpu, vsock.device.device.clone());

@@ -506,6 +506,26 @@ fn symlink_follow_is_confined_and_loop_limited() {
     assert!(matches!(error, fs_types::ErrorCode::Loop));
 }
 
+/// A Wasmtime component artifact as the boot payload carries it: the
+/// bare precompiled ELF, with no signature trailer. Classification
+/// reads only the header (the ELF identification, the Wasmtime OS ABI and
+/// the component flag), so the fixture is that header with no sections:
+/// the kernel's Wasmtime has no compiler to build a real one.
+fn bootfs_cwasm() -> &'static [u8] {
+    let mut header = [0_u8; 64];
+    header[..4].copy_from_slice(b"\x7fELF");
+    header[4] = 2; // ELFCLASS64
+    header[5] = 1; // little-endian
+    header[6] = 1; // EV_CURRENT
+    header[7] = 200; // ELFOSABI_WASMTIME
+    header[16..18].copy_from_slice(&1_u16.to_le_bytes()); // ET_REL
+    header[20..24].copy_from_slice(&1_u32.to_le_bytes()); // e_version
+    header[48..52].copy_from_slice(&2_u32.to_le_bytes()); // EF_WASMTIME_COMPONENT
+    header[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+    header[58..60].copy_from_slice(&64_u16.to_le_bytes()); // e_shentsize
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(header))
+}
+
 /// A cwasm signed by a key the kernel does not trust: it parses as an
 /// artifact, and only a signature check tells it apart.
 fn foreign_signed_cwasm() -> &'static [u8] {
@@ -514,12 +534,18 @@ fn foreign_signed_cwasm() -> &'static [u8] {
     alloc::boxed::Box::leak(signed.into_boxed_slice())
 }
 
-/// A namespace whose boot image carries `foreign_signed_cwasm` at
-/// `/bin/prog`.
+/// The compiler-signing key of one boot, derived from a fixed seed.
+fn boot_key(seed: u8) -> crate::CwasmSigningKey {
+    crate::CwasmSigningKey::from_seed(&helios_hal::measured_boot::SealedSecret::new(
+        [seed; helios_hal::measured_boot::SealedSecret::LEN],
+    ))
+}
+
+/// A namespace whose boot image carries `bootfs_cwasm` at `/bin/prog`.
 fn namespace_with_bootfs_cwasm() -> TestNamespace {
     let files = alloc::boxed::Box::leak(alloc::boxed::Box::new([EmbeddedBootFile::new(
         "bin/prog",
-        foreign_signed_cwasm(),
+        bootfs_cwasm(),
         42,
     )]));
     const DIRECTORIES: &[EmbeddedBootDirectory] = &[EmbeddedBootDirectory::new("mnt", 0)];
@@ -548,15 +574,18 @@ fn bootfs_cwasm_loads_without_signature_verification() {
     let ProgramSource::BootfsArtifact(bytes) = program_source(&namespace, "/bin/prog") else {
         panic!("a bootfs cwasm must classify as a bootfs artifact");
     };
-    // The signature would not verify, so accepting it proves the bootfs
-    // path pays no verification.
-    assert!(cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice())).is_err());
-    let trusted = cwasm::trust_bootfs_artifact(&bytes).expect("a bootfs artifact loads unverified");
-    assert_eq!(trusted.payload(), b"payload");
+    // It carries no signature trailer, so accepting it proves the
+    // bootfs path pays no per-artifact verification.
+    assert!(
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(bytes.as_slice()), &boot_key(1)).is_err()
+    );
+    let trusted = cwasm::trust_bootfs_artifact(&bytes);
+    assert_eq!(trusted.payload(), bytes.as_slice());
 }
 
 #[test]
 fn guest_written_cwasm_must_verify() {
+    let kernel_key = boot_key(1);
     let namespace = namespace_with_bootfs_cwasm();
     block_on(create_directory_at(&namespace, held(&root()), "tmp", 1))
         .expect("creating /tmp must succeed");
@@ -572,23 +601,71 @@ fn guest_written_cwasm_must_verify() {
     };
     for copy in ["tmp/copy", "mnt/copy"] {
         create_file(&namespace, copy, copied.as_slice());
-        let ProgramSource::SignedArtifact(bytes) =
-            program_source(&namespace, &alloc::format!("/{copy}"))
-        else {
-            panic!("a guest-written cwasm at /{copy} must classify as a signed artifact");
-        };
-        assert!(matches!(
-            cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
-            Err(cwasm::ArtifactTrustError::Trailer(
-                helios_artifact::TrailerError::UntrustedSigner
-            ))
-        ));
+        // A bare cwasm has no signature to verify, so the copy is never
+        // a bootfs or signed artifact; it is raw bytes the wasm
+        // validator then refuses.
+        assert!(
+            matches!(
+                program_source(&namespace, &alloc::format!("/{copy}")),
+                ProgramSource::RawWasm(_)
+            ),
+            "a guest-written copy at /{copy} must classify as raw wasm"
+        );
     }
+
+    block_on(write_program_file(
+        &namespace,
+        "/tmp/foreign",
+        foreign_signed_cwasm(),
+        3,
+    ))
+    .expect("writing a program file must succeed");
+    let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/foreign") else {
+        panic!("a guest-written cwasm must classify as a signed artifact");
+    };
+    assert!(matches!(
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes), &kernel_key),
+        Err(cwasm::ArtifactTrustError::Trailer(
+            helios_artifact::TrailerError::UntrustedSigner
+        ))
+    ));
+
+    // The build root verifies the boot payload and nothing else: a cwasm
+    // signed with its secret, which any image built before it left the
+    // kernel would have carried, is refused.
+    block_on(write_program_file(
+        &namespace,
+        "/tmp/root-signed",
+        &cwasm::sign_artifact_with_build_root_for_tests(b"payload"),
+        3,
+    ))
+    .expect("writing a program file must succeed");
+    let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/root-signed")
+    else {
+        panic!("a guest-written cwasm must classify as a signed artifact");
+    };
+    assert!(matches!(
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes), &kernel_key),
+        Err(cwasm::ArtifactTrustError::Trailer(
+            helios_artifact::TrailerError::UntrustedSigner
+        ))
+    ));
+
+    // What an earlier boot's key signed does not verify under this
+    // boot's key.
+    let previous_boot = cwasm::sign_artifact_payload(b"payload", &boot_key(2))
+        .expect("signing with a boot key must succeed");
+    assert!(matches!(
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(&previous_boot), &kernel_key),
+        Err(cwasm::ArtifactTrustError::Trailer(
+            helios_artifact::TrailerError::UntrustedSigner
+        ))
+    ));
 
     // A kernel-signed artifact with one signature byte flipped, as
     // `write_program_file` would store it, is refused too.
-    let mut tampered = cwasm::sign_trusted_artifact_payload(b"payload")
-        .expect("signing with the trusted root must succeed");
+    let mut tampered = cwasm::sign_artifact_payload(b"payload", &kernel_key)
+        .expect("signing with the kernel key must succeed");
     let last_signature_byte = tampered.len() - 13;
     tampered[last_signature_byte] ^= 1;
     block_on(write_program_file(
@@ -602,22 +679,22 @@ fn guest_written_cwasm_must_verify() {
         panic!("a guest-written cwasm must classify as a signed artifact");
     };
     assert!(matches!(
-        cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes)),
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes), &kernel_key),
         Err(cwasm::ArtifactTrustError::Trailer(
             helios_artifact::TrailerError::InvalidPayloadSignature
         ))
     ));
 
-    // What the in-kernel compiler writes is signed by the trusted root,
+    // What the in-kernel compiler writes is signed by this boot's key,
     // and that is what lets a guest exec it from anywhere.
-    let signed = cwasm::sign_trusted_artifact_payload(b"payload")
-        .expect("signing with the trusted root must succeed");
+    let signed = cwasm::sign_artifact_payload(b"payload", &kernel_key)
+        .expect("signing with the kernel key must succeed");
     block_on(write_program_file(&namespace, "/tmp/compiled", &signed, 5))
         .expect("writing a program file must succeed");
     let ProgramSource::SignedArtifact(bytes) = program_source(&namespace, "/tmp/compiled") else {
         panic!("a guest-written cwasm must classify as a signed artifact");
     };
-    let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes))
+    let trusted = cwasm::verify_signed_artifact(UntrustedCwasm::new(&bytes), &kernel_key)
         .expect("a kernel-signed artifact must verify");
     assert_eq!(trusted.payload(), b"payload");
 }

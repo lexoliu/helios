@@ -53,9 +53,9 @@ pub(crate) fn count_block_devices(platform: &PlatformDescription) -> usize {
 /// Brings up every block device on the platform bus and hands them to
 /// the kernel, which gives each the role its serial names and returns
 /// the scratch disk for swap.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &Aarch64Cpu,
-    kernel: &helios_kernel::Kernel<Aarch64Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -64,6 +64,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<BlockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered = discover_block_devices(cpu, platform, physical_memory_offset, handoff);
     let devices = discovered

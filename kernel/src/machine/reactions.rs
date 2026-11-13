@@ -52,6 +52,7 @@ use core::future::Future;
 use core::pin::pin;
 
 use helios_hal::cpu::Cpu;
+use helios_hal::measured_boot::MeasuredBoot;
 use helios_hal::rtc::RealTimeClock;
 use helios_hal::watchdog::Watchdog;
 
@@ -88,17 +89,19 @@ pub(crate) trait ReactionSteps {
 pub fn install_generation_reactions<
     CpuImpl,
     WatchdogImpl,
+    MeasuredBootImpl,
     ProgramService,
     NetworkService,
     StorageImpl,
     Rtc,
 >(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     runtime_state: RuntimeState<ProgramService, NetworkService, StorageImpl>,
     rtc: Option<Rtc>,
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
     ProgramService: Clone + 'static,
     NetworkService: ComponentNetworkService,
     StorageImpl: crate::Storage,

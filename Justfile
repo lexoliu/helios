@@ -27,7 +27,6 @@ check-target target package:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     build_std="{{ if target == build_std_target { build_std_flag } else { "" } }}"
     # Unquoted on purpose: an empty value must expand to no argument.
     cargo check ${build_std} -p helios-kernel \
@@ -119,8 +118,12 @@ test-units:
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
     export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
-    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-kernel --lib
+    cargo nextest run -p helios-hal -p helios-virtio -p helios-netstack -p helios-artifact -p helios-kernel --lib
     cargo nextest run -p helios-workspace-root --lib
+    # The TPM driver: both interfaces against register models that
+    # enforce their state machines, and the sealing scenario replayed
+    # from its committed swtpm recording.
+    cargo nextest run -p helios-tpm
     # What the desktop draws with — damage tracking, focus routing, the
     # terminal grid — is a plain library (`programs/compositor/render`)
     # and is tested here rather than only inside a boot, alongside the
@@ -174,7 +177,6 @@ clippy-target target package:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     # Two invocations, for the same reason `check-target` uses explicit
     # features: cargo would otherwise unify helios-kernel's host defaults with
     # the backend's `wasmtime-bare-metal` selection.
@@ -208,10 +210,13 @@ build-instrumented arch:
 # because a PGO kernel is only as good as the profile behind it, and the
 # inspector refuses one this toolchain cannot read before cargo starts.
 # `bench-suite.yml` uploads one as `helios-kernel-profdata`.
+# Further arguments are `vm` options: the release workflow passes
+# `--root-secret-key <file>` so the kernel it ships trusts the release key
+# (docs/boot.md).
 # Usage: just kernel-pgo-use x86-64 target/pgo/helios-kernel.profdata
-kernel-pgo-use arch profile:
+kernel-pgo-use arch profile *vm_options:
     cargo run -p helios-inspector --quiet -- \
-        vm --arch {{arch}} --profile-use {{profile}} build
+        vm --arch {{arch}} --profile-use {{profile}} {{vm_options}} build
 
 # Equivalent of AGENTS §7 required checks. Run before declaring a change complete.
 check-all:
@@ -237,7 +242,6 @@ check-host:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     cargo check -p helios-kernel
     cargo check -p helios-hosted
     cargo check -p helios-inspector
@@ -259,7 +263,6 @@ test-embedded-debugger:
         --profile "{{default_profile}}" \
         --cargo cargo
     export HELIOS_KERNEL_ROOT_PUBLIC_KEY="${out_dir}/helios-root-public.key"
-    export HELIOS_KERNEL_ROOT_SECRET_KEY="${out_dir}/helios-root-secret.key"
     export HELIOS_BOOTFS="${out_dir}/helios-bootfs"
     cargo nextest run -p helios-hosted --no-capture init_program::tests::embedded_debugger_
 

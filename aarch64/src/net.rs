@@ -39,9 +39,9 @@ pub(crate) struct NetworkInterrupt {
     pub(crate) device: VirtioNetworkDevice,
 }
 
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &crate::Aarch64Cpu,
-    kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl>,
+    kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -49,6 +49,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<NetworkInterrupt>
 where
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     // The pair budget is the processor count: every activated pair is
     // drained by the one packet pump its owning processor runs, so a

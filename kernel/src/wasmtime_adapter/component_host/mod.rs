@@ -42,7 +42,7 @@ use crate::exec::phases::{self, LaunchPhase};
 use crate::wasmtime_adapter::bindings::debugger::bindings as debugger_bindings;
 use crate::wasmtime_adapter::bindings::program::bindings as program_bindings;
 use crate::wasmtime_adapter::config::AotCompileHint;
-use crate::wasmtime_adapter::cwasm::{self, ArtifactTrustError};
+use crate::wasmtime_adapter::cwasm;
 use crate::wasmtime_adapter::wasi::ChannelStreamProducer;
 use crate::wasmtime_adapter::wasi::bindings::filesystem::types::ErrorCode as FsErrorCode;
 use crate::{
@@ -1759,7 +1759,7 @@ where
         "loading embedded system component artifact"
     );
     let artifact = component.bootfs_bytes();
-    let trusted = cwasm::trust_bootfs_artifact(&artifact).map_err(DebuggerError::TrustComponent)?;
+    let trusted = cwasm::trust_bootfs_artifact(&artifact);
     let compiled = crate::wasmtime_adapter::WasmtimeCompiledComponent {
         component: unsafe {
             wasmtime::component::Component::deserialize(engine.raw(), trusted.payload())
@@ -4891,8 +4891,6 @@ fn emit_program_stage_marker(write_serial: crate::DebugSerialWriter, stage: &str
 enum DebuggerError {
     #[error("failed to initialize Wasmtime engine: {0:#}")]
     CreateEngine(wasmtime::Error),
-    #[error("failed to validate embedded debugger artifact: {0}")]
-    TrustComponent(ArtifactTrustError),
     #[error("failed to load embedded debugger component: {0:#}")]
     LoadComponent(wasmtime::Error),
     #[error("failed to instantiate debugger component: {0:#}")]

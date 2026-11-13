@@ -311,14 +311,15 @@ where
 /// the backend's device. The identification task and the cache's
 /// reclaim task run on the calling processor; every other request a
 /// disk sees is issued by the task that needs it, on its own processor.
-pub fn install_block_devices<CpuImpl, WatchdogImpl, Device, Install>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_block_devices<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device, Install>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     root: RootEntropyHandle,
     devices: Vec<Device>,
     install: Install,
 ) where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: BlockDevice<Buffer = BlockPages> + 'static,
     Install: FnOnce(BlockService, ScratchDisk<Device>, Option<BlockCache<Device>>) + 'static,
 {

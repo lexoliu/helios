@@ -146,7 +146,7 @@ where
         crate::OomPolicy::KernelPlugin,
     );
 
-    let payload = trusted_bootfs_payload(artifact)?;
+    let payload = trusted_bootfs_payload(artifact);
     let instance_pre = service.load_precompiled_component(
         HTTP_CLIENT_PLUGIN_PATH,
         payload,

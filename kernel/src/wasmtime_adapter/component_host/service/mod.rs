@@ -83,6 +83,7 @@ use helios_compiler_abi::{
     HELIOS_COMPILER_PTHREAD_SELF_OFFSET,
 };
 use helios_hal::fs::WritePosition;
+use helios_hal::measured_boot::{MeasuredBoot, Sha256Digest};
 use helios_hal::watchdog::Watchdog;
 use smallvec::SmallVec;
 use thiserror::Error;
@@ -336,6 +337,10 @@ where
     // whose imports are independent of per-process shared-memory binding.
     core_module_instance_pre_cache: CoreModuleInstancePreCache<CpuImpl, Net, StorageImpl>,
     compiler_artifact: Option<BootfsBytes>,
+    /// The key the compiler plugin's output is signed with, and the only
+    /// key a written `cwasm` verifies against. Settled at bring-up,
+    /// before this service exists, and never replaced.
+    cwasm_signing_key: crate::CwasmSigningKey,
     /// The level the in-kernel compiler emits, selected once at install.
     guest_isa: GuestIsa,
     /// Lazily-built compiler kernel-plugin runtime. The plugin's
@@ -394,7 +399,9 @@ impl ProgramSource {
     /// that produced its bytes gave them.
     pub(crate) fn from_file(contents: FileContents) -> Self {
         match contents {
-            FileContents::Boot(bytes) if cwasm::is_cwasm(bytes.as_slice()) => {
+            FileContents::Boot(bytes)
+                if WasmtimePrecompiledKind::detect(bytes.as_slice()).is_some() =>
+            {
                 Self::BootfsArtifact(bytes)
             }
             FileContents::Boot(bytes) => Self::RawWasm(bytes.to_bytes()),
@@ -488,8 +495,8 @@ pub struct ChildExit {
     filesystem: Option<MemoryFs>,
 }
 
-pub fn install_program_service<CpuImpl, Net, StorageImpl, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_program_service<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
@@ -500,12 +507,19 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     install_program_service_inner(kernel, cpu, debug_state, read_serial, write_serial)
 }
 
-pub fn install_component_host_program_service<CpuImpl, Net, StorageImpl, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_component_host_program_service<
+    CpuImpl,
+    Net,
+    StorageImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
@@ -516,6 +530,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let topology = kernel.topology();
     if helios_hal::cpu::current_processor() != topology.bootstrap_processor {
@@ -531,8 +546,8 @@ where
     ))
 }
 
-fn install_program_service_inner<CpuImpl, Net, StorageImpl, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+fn install_program_service_inner<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
@@ -543,11 +558,27 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     if let Some(service) = debug_state.program_service() {
+        // The service and its key exist already; a device still held
+        // here would never be measured into or read.
+        assert!(
+            kernel.take_measured_boot().is_none(),
+            "the program service was installed before the measured-boot device it was handed \
+             settled the compiler-signing key"
+        );
         return service;
     }
 
+    // The signing key is settled before any program can be admitted,
+    // with the measured-boot device the platform handed the kernel.
+    let mut measured_boot = kernel.take_measured_boot();
+    let cwasm_signing_key = crate::signing_key::settle_signing_key_at_bring_up(
+        measured_boot.as_mut(),
+        &Sha256Digest(debug_state.payload_digest()),
+        debug_state.root_entropy(),
+    );
     // Selected by the backend when it built the runtime state, before any
     // secondary processor ran guest code, and logged once here: this is the
     // single place every backend's program service passes through, after the
@@ -576,6 +607,7 @@ where
             core_module_cache: Mutex::new(ComponentCache::new(cache_budget)),
             core_module_instance_pre_cache: Arc::new(Mutex::new(ComponentCache::new(cache_budget))),
             compiler_artifact,
+            cwasm_signing_key,
             guest_isa,
             compiler_plugin: Mutex::new(None),
             compile_slot: CompilerCompileSlot::new(),
@@ -607,8 +639,8 @@ where
 /// the rings are drained every [`crate::SAMPLE_DRAIN_INTERVAL_MILLIS`]
 /// rather than once when the profile is read. Between profiles the task
 /// parks on the sampler's start signal and costs nothing.
-fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     service: &UserProgramService<CpuImpl, Net, StorageImpl>,
     debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) where
@@ -616,6 +648,7 @@ fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl>(
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let sampler = debug_state.instruction_sampler();
     let code_map = service.code_map().clone();
@@ -632,11 +665,11 @@ fn spawn_instruction_sample_drain<CpuImpl, Net, StorageImpl, WatchdogImpl>(
     });
 }
 
-pub fn run_embedded_component_forever<CpuImpl, Net, StorageImpl, WatchdogImpl>(
+pub fn run_embedded_component_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     component: EmbeddedComponent,
     world: ComponentBindingSet,
     cpu: CpuImpl,
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
@@ -646,6 +679,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let component_name = component.name();
     write_serial.emit_stage_marker("boot");
@@ -760,14 +794,15 @@ where
 /// rather than checking and giving up; `run_packet_pump` then resolves
 /// the pair assignment from the topology and either pumps it or
 /// returns.
-fn spawn_network_packet_pump<CpuImpl, Net, StorageImpl, WatchdogImpl>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+fn spawn_network_packet_pump<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: &HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let debug_state = debug_state.clone();
     kernel.spawn_local_detached(async move {
@@ -778,9 +813,9 @@ fn spawn_network_packet_pump<CpuImpl, Net, StorageImpl, WatchdogImpl>(
     });
 }
 
-pub fn run_program_workers_forever<CpuImpl, Net, StorageImpl, WatchdogImpl>(
+pub fn run_program_workers_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     _cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) -> !
 where
@@ -788,14 +823,21 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     spawn_network_packet_pump(&kernel, &debug_state);
     kernel.run()
 }
 
-pub fn run_component_host_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl>(
+pub fn run_component_host_processor_forever<
+    CpuImpl,
+    Net,
+    StorageImpl,
+    WatchdogImpl,
+    MeasuredBootImpl,
+>(
     cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
@@ -805,6 +847,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     spawn_network_packet_pump(&kernel, &debug_state);
     let topology = kernel.topology();
@@ -890,9 +933,9 @@ fn report_fiber_stack_demand_commits<CpuImpl: Cpu>(cpu: &CpuImpl) {
     );
 }
 
-fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl>(
+fn run_kernel_processor_forever<CpuImpl, Net, StorageImpl, WatchdogImpl, MeasuredBootImpl>(
     cpu: CpuImpl,
-    kernel: crate::Kernel<CpuImpl, WatchdogImpl>,
+    kernel: crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     debug_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
 ) -> !
 where
@@ -900,6 +943,7 @@ where
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let processor = helios_hal::cpu::current_processor().id();
     let stack = kernel_processor_profile_stack(processor);
@@ -1592,7 +1636,7 @@ where
                         detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
                     });
                 }
-                trusted_signed_payload(bytes)?
+                trusted_signed_payload(bytes, &self.inner.cwasm_signing_key)?
             }
             ProgramSource::BootfsArtifact(bytes) => {
                 if hint.is_some() {
@@ -1601,7 +1645,7 @@ where
                         detail: ProgramExecErrorDetail::HintNotAllowedForPrecompiledArtifact,
                     });
                 }
-                trusted_bootfs_payload(bytes)?
+                trusted_bootfs_payload(bytes)
             }
             ProgramSource::RawWasm(wasm) => {
                 let _profile = artifact_profile::classify_raw_wasm(wasm)
@@ -1617,7 +1661,7 @@ where
                     )
                     .await?;
                 let signed = Bytes::from(signed);
-                trusted_signed_payload(&signed)?
+                trusted_signed_payload(&signed, &self.inner.cwasm_signing_key)?
             }
         };
         timeline.record(&self.inner.clock_cpu, LaunchPhase::ArtifactTrust);
@@ -1852,7 +1896,7 @@ where
         };
         let compiler_artifact = self.read_compiler_plugin_artifact(exec_context)?;
         let job = CompileJob {
-            compiler_payload: trusted_bootfs_payload(&compiler_artifact)?,
+            compiler_payload: trusted_bootfs_payload(&compiler_artifact),
             wasm: wasm.clone(),
             hint,
             profile,
@@ -1924,27 +1968,29 @@ where
                     self.run_compile(exec_context, job, instance, phases),
                 )
             },
-            |end| Self::sign_compiled(exec_context, profile, end),
+            |end| self.sign_compiled(exec_context, profile, end),
         )
         .await;
     }
 
-    /// Signs what a finished compile produced and reports its phases.
+    /// Signs what a finished compile produced with this boot's key and
+    /// reports its phases.
     fn sign_compiled(
+        &self,
         exec_context: &ProgramExecContext<CpuImpl, Net, StorageImpl>,
         profile: bool,
         end: CompileEnd,
     ) -> Result<Vec<u8>, ProgramExecError> {
         let CompileEnd { result, mut phases } = end;
         let (payload, thread_reports) = result?;
-        let signed =
-            cwasm::sign_trusted_artifact_payload(&payload).map_err(map_artifact_trust_error)?;
+        let signed = cwasm::sign_artifact_payload(&payload, &self.inner.cwasm_signing_key)
+            .map_err(map_artifact_trust_error)?;
         phases.signed_ns = if profile {
             monotonic_nanos(&exec_context.cpu)
         } else {
             0
         };
-        cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed))
+        cwasm::verify_signed_artifact(UntrustedCwasm::new(&signed), &self.inner.cwasm_signing_key)
             .map_err(map_artifact_trust_error)?;
         phases.verified_ns = if profile {
             monotonic_nanos(&exec_context.cpu)

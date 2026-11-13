@@ -190,6 +190,7 @@ mod net;
 mod platform;
 mod rtc;
 mod snd;
+mod tpm;
 mod vsock;
 
 mod debug_state {
@@ -253,6 +254,11 @@ static DEVICE_TREE_BLOB_REQUEST: DtbRequest = DtbRequest::new();
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 #[used]
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(KERNEL_STACK_BYTES as u64);
+/// The firmware's TPM event log, which the measured-boot discovery reads
+/// to learn whether Limine measured the kernel (`tpm::discover`).
+#[used]
+static TPM_EVENT_LOG_REQUEST: helios_kernel::LimineTpmEventLogRequest =
+    helios_kernel::LimineTpmEventLogRequest::new();
 static DEBUG_SERIAL_BASE: AtomicUsize = AtomicUsize::new(0);
 static CRITICAL_SECTION_STATE: helios_hal::critical_section::CriticalSectionState =
     helios_hal::critical_section::CriticalSectionState::new();
@@ -686,6 +692,11 @@ extern "C" fn aarch64_kernel_main() -> ! {
     if block_device_count != 0 {
         devices = devices.with_block_devices(block_device_count);
     }
+    // The TPM is checked before the kernel exists, because whether the
+    // kernel is handed one is part of the platform it is built from; the
+    // outcome is reported once the logger is up.
+    let (measured_boot, measured_boot_discovery) =
+        tpm::discover(&platform, physical_memory_offset, &handoff, cpu);
     let kernel = helios_kernel::init(
         Platform::new(console, core::iter::empty::<MemoryRegion>(), cpu)
             .with_topology(
@@ -697,8 +708,14 @@ extern "C" fn aarch64_kernel_main() -> ! {
             )
             .with_timer_frequency_hz(cpu.timebase().frequency())
             .with_dma_model(DmaModel::Translated)
-            .with_devices(devices),
+            .with_devices(devices)
+            .with_measured_boot(measured_boot),
     );
+    if measured_boot_discovery.is_refusal() {
+        tracing::warn!("{measured_boot_discovery}");
+    } else {
+        tracing::info!("{measured_boot_discovery}");
+    }
     tracing::info!(
         "platform described by {} console={:#x} gicd={:#x} gicr={:#x} virtio-slots={} rtc={}",
         platform.source,
@@ -2371,6 +2388,7 @@ fn limine_boot_handoff() -> LimineBootHandoff {
             device_tree_blob: DEVICE_TREE_BLOB_REQUEST
                 .response()
                 .map(|response| response.dtb_ptr as usize),
+            measurement_log: TPM_EVENT_LOG_REQUEST.measurement_log(),
         },
     }
 }

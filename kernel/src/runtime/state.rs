@@ -1185,6 +1185,12 @@ where
     pub fn has_system_component(&self) -> bool {
         self.inner.payload.has_system_component()
     }
+
+    /// SHA-256 of the payload body whose signature the kernel verified,
+    /// the value bring-up measures before it reads the sealed seed.
+    pub fn payload_digest(&self) -> helios_artifact::bootfs::Digest256 {
+        self.inner.payload.digest()
+    }
 }
 
 /// The system-wide observation snapshot.
