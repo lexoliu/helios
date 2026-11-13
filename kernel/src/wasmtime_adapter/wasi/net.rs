@@ -1441,15 +1441,16 @@ where
         _: bool,
     ) -> Poll<Result<StreamResult>> {
         let mut this = self.project();
+        // The guest's whole write, one chunk at a time: `Completed` ends its
+        // `stream.write`, so it is reported only once the source is empty.
         loop {
             if this.pending.is_none() {
-                let available = source.remaining(&mut store);
-                if available == 0 {
-                    complete_socket_transfer(this.completion, Ok(()));
+                // One chunk per write, the size preview1's `sock_send`
+                // moves to the same socket.
+                let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
+                if bytes.is_empty() {
                     return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                let mut bytes = Vec::with_capacity(available);
-                source.read(&mut store, &mut bytes)?;
                 let write = (*this.start)(
                     this.socket.clone(),
                     this.service.clone(),
@@ -1466,12 +1467,11 @@ where
                 None => unreachable!("tcp write future must be present before polling"),
             };
             this.pending.set(None);
-            match result {
-                Ok(()) => continue,
-                Err(error) => {
-                    complete_socket_transfer(this.completion, Err(error));
-                    return Poll::Ready(Ok(StreamResult::Dropped));
-                }
+            if let Err(error) = result {
+                // The error is reported through `completion`, the chunk in
+                // hand is lost and the rest of the write stays unread.
+                complete_socket_transfer(this.completion, Err(error));
+                return Poll::Ready(Ok(StreamResult::Dropped));
             }
         }
     }

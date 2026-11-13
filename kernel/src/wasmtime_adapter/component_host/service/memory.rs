@@ -13,14 +13,6 @@ pub(super) struct Preview1Memory {
     pub(super) len: usize,
 }
 
-/// The most guest bytes one host call holds in kernel memory at once when
-/// it has to copy them out of linear memory. A transfer larger than this
-/// moves in successive chunks, so what a call holds never grows with the
-/// guest's length. 64 KiB is the largest UDP payload (`u16::MAX` rounded to
-/// a power of two) and the WASI UDP default buffer size
-/// (`DEFAULT_WASI_UDP_BUFFER_BYTES`).
-pub(super) const P1_IO_CHUNK_BYTES: usize = 64 * 1024;
-
 /// The size of a preview1 `iovec`: a `u32` buffer address and a `u32`
 /// length (WASI snapshot preview1 `iovec`/`ciovec` layout).
 const P1_IOVEC_BYTES: usize = 8;
@@ -337,7 +329,7 @@ pub(super) fn p1_read_iovs_with_byte_len(
 }
 
 /// The guest bytes `layout`'s iovecs name, copied out one bounded chunk at
-/// a time ([`P1_IO_CHUNK_BYTES`]) so a gathered write holds kernel memory
+/// a time ([`GUEST_IO_CHUNK_BYTES`]) so a gathered write holds kernel memory
 /// for a chunk, never for the whole transfer.
 pub(super) struct Preview1Gather {
     memory: Preview1Memory,
@@ -366,7 +358,7 @@ impl Preview1Gather {
 
     /// The length of the next chunk.
     pub(super) fn next_len(&self) -> usize {
-        self.remaining.min(P1_IO_CHUNK_BYTES)
+        self.remaining.min(GUEST_IO_CHUNK_BYTES)
     }
 
     /// Copies the next `destination.len()` bytes, which is at most

@@ -1347,6 +1347,17 @@ pub(crate) mod test_store {
         authority: ProcessAuthority,
         configure: impl FnOnce(&HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage>),
     ) -> TestStoreData {
+        store_data_routed(authority, ComponentOutputMode::Serial, configure)
+    }
+
+    /// As [`store_data_authorized`], for an instance whose stdout and
+    /// stderr go where `output_mode` says: what a stream test needs to
+    /// observe the bytes a guest's write reaches its sink as.
+    pub(crate) fn store_data_routed(
+        authority: ProcessAuthority,
+        output_mode: ComponentOutputMode,
+        configure: impl FnOnce(&HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage>),
+    ) -> TestStoreData {
         let cpu = TestCpu::with_entropy(0x5a);
         let runtime_state: HostRuntimeState<TestCpu, TestNetworkService, UnsupportedStorage> =
             crate::RuntimeState::new(
@@ -1384,7 +1395,7 @@ pub(crate) mod test_store {
             Vec::new(),
             Vec::new(),
             authority,
-            ComponentOutputMode::Serial,
+            output_mode,
             read_nothing,
             crate::DebugSerialWriter::of::<DiscardPort>(),
         )

@@ -1027,37 +1027,42 @@ where
         _: bool,
     ) -> Poll<Result<StreamResult>> {
         let mut this = self.project();
-        if this.pending.is_none() {
-            let available = source.remaining(&mut store);
-            if available == 0 {
-                return Poll::Ready(Ok(StreamResult::Completed));
-            }
-            let mut bytes = Vec::with_capacity(available);
-            source.read(&mut store, &mut bytes)?;
-            let now = (*this.getter)(store.data_mut()).now_nanos();
-            let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
-            this.pending.set(Some(write));
-        }
-        let written = match this.pending.as_mut().as_pin_mut() {
-            Some(pending) => match pending.poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => result,
-            },
-            None => unreachable!("a write future was started above"),
-        };
-        this.pending.set(None);
-        match written {
-            Ok(written) => {
-                if let WritePosition::At(offset) = this.mode {
-                    *offset = offset.checked_add(written as u64).ok_or_else(|| {
-                        wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
-                    })?;
+        // The guest's whole write, one chunk at a time: `Completed` ends its
+        // `stream.write`, so it is reported only once the source is empty.
+        loop {
+            if this.pending.is_none() {
+                // One chunk per write, the size preview1's `fd_write` moves
+                // for the same file.
+                let bytes = read_bounded_chunk(&mut source, &mut store, GUEST_IO_CHUNK_BYTES)?;
+                if bytes.is_empty() {
+                    return Poll::Ready(Ok(StreamResult::Completed));
                 }
-                Poll::Ready(Ok(StreamResult::Completed))
+                let now = (*this.getter)(store.data_mut()).now_nanos();
+                let write = (*this.start)(this.held.clone(), *this.mode, bytes, now);
+                this.pending.set(Some(write));
             }
-            Err(error) => {
-                complete_file_transfer(this.result, Err(error));
-                Poll::Ready(Ok(StreamResult::Dropped))
+            let written = match this.pending.as_mut().as_pin_mut() {
+                Some(pending) => match pending.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => result,
+                },
+                None => unreachable!("a write future was started above"),
+            };
+            this.pending.set(None);
+            match written {
+                Ok(written) => {
+                    if let WritePosition::At(offset) = this.mode {
+                        *offset = offset.checked_add(written as u64).ok_or_else(|| {
+                            wasmtime::Error::new(WasiAdapterTrap::FileWriteOffsetOverflow)
+                        })?;
+                    }
+                }
+                Err(error) => {
+                    // The error is reported through `result`, the chunk in
+                    // hand is lost and the rest of the write stays unread.
+                    complete_file_transfer(this.result, Err(error));
+                    return Poll::Ready(Ok(StreamResult::Dropped));
+                }
             }
         }
     }
