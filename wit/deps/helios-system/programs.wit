@@ -155,6 +155,19 @@ interface programs {
     rights: list<diagnostics-right>,
   }
 
+  /// A right over the machine itself rather than over what runs on it.
+  enum machine-right {
+    /// Take processors offline and bring them online
+    /// (`helios:system/processors`).
+    control-processors,
+  }
+
+  record machine-grant {
+    /// Machine rights granted to the child. These must be a subset of
+    /// the caller's machine authority.
+    rights: list<machine-right>,
+  }
+
   variant capability-grant {
     directory(directory-grant),
     network(network-grant),
@@ -165,6 +178,7 @@ interface programs {
     mount(mount-grant),
     device(device-grant),
     diagnostics(diagnostics-grant),
+    machine(machine-grant),
   }
 
   record spawn-request {

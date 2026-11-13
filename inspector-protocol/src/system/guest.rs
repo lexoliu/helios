@@ -1,16 +1,19 @@
 use futures_io::{AsyncRead, AsyncWrite};
 use helios_api::{
-    instances as host_instances, profiling as host_profiling, programs as host_programs,
-    stats as host_stats, tracing as host_tracing,
+    instances as host_instances, processors as host_processors, profiling as host_profiling,
+    programs as host_programs, stats as host_stats, tracing as host_tracing,
 };
 
 use crate::error::DispatchError;
 use crate::system::accept;
 use crate::system::server::{self, Dispatcher, Invocations};
 
-use super::bindings::helios::system::{filters, instances, profiling, programs, stats, tracing};
+use super::bindings::helios::system::{
+    filters, instances, processors, profiling, programs, stats, tracing,
+};
 use super::methods::{
-    INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROFILING_CLEAR, PROFILING_FOLDED,
+    INSTANCES_INSTANCE, INSTANCES_KILL, INSTANCES_SNAPSHOT, PROCESSORS_INSTANCE,
+    PROCESSORS_OFFLINE, PROCESSORS_ONLINE, PROCESSORS_SETS, PROFILING_CLEAR, PROFILING_FOLDED,
     PROFILING_INSTANCE, PROFILING_INSTRUCTION_SAMPLES, PROFILING_METRICS,
     PROFILING_RAW_PROFILE_READ, PROFILING_RAW_PROFILE_SIZE, PROFILING_SET_ENABLED,
     PROFILING_SET_INSTRUCTION_SAMPLING, PROGRAMS_AOT, PROGRAMS_EXEC, PROGRAMS_INSTANCE,
@@ -70,6 +73,9 @@ fn supports_request(instance: &str, func: &str) -> bool {
             | (STATS_INSTANCE, STATS_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_SNAPSHOT)
             | (INSTANCES_INSTANCE, INSTANCES_KILL)
+            | (PROCESSORS_INSTANCE, PROCESSORS_SETS)
+            | (PROCESSORS_INSTANCE, PROCESSORS_OFFLINE)
+            | (PROCESSORS_INSTANCE, PROCESSORS_ONLINE)
             | (TRACING_INSTANCE, TRACING_RECENT)
             | (TRACING_INSTANCE, TRACING_SET_TARGET_ENABLED)
             | (PROFILING_INSTANCE, PROFILING_SET_ENABLED)
@@ -195,6 +201,50 @@ async fn dispatch(
             let answer = host_instances::kill(id).map_err(convert_kill_error);
             postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
                 operation: "instances.kill",
+                source,
+            })
+        }
+        (PROCESSORS_INSTANCE, PROCESSORS_SETS) => {
+            if !payload.is_empty() {
+                return Err(DispatchError::UnexpectedPayload {
+                    operation: "processors.sets",
+                });
+            }
+            let sets = convert_processor_sets(host_processors::sets());
+            postcard::to_allocvec(&sets).map_err(|source| DispatchError::Encode {
+                operation: "processors.sets",
+                source,
+            })
+        }
+        (PROCESSORS_INSTANCE, PROCESSORS_OFFLINE) => {
+            let processor =
+                postcard::from_bytes::<processors::ProcessorId>(payload).map_err(|source| {
+                    DispatchError::Decode {
+                        operation: "processors.offline",
+                        source,
+                    }
+                })?;
+            let answer = host_processors::offline(processor)
+                .await
+                .map_err(convert_offline_error);
+            postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
+                operation: "processors.offline",
+                source,
+            })
+        }
+        (PROCESSORS_INSTANCE, PROCESSORS_ONLINE) => {
+            let processor =
+                postcard::from_bytes::<processors::ProcessorId>(payload).map_err(|source| {
+                    DispatchError::Decode {
+                        operation: "processors.online",
+                        source,
+                    }
+                })?;
+            let answer = host_processors::online(processor)
+                .await
+                .map_err(convert_online_error);
+            postcard::to_allocvec(&answer).map_err(|source| DispatchError::Encode {
+                operation: "processors.online",
                 source,
             })
         }
@@ -452,8 +502,23 @@ fn map_capability_grants_to_host(
                         .collect(),
                 })
             }
+            programs::CapabilityGrant::Machine(grant) => {
+                host_programs::CapabilityGrant::Machine(host_programs::MachineGrant {
+                    rights: grant
+                        .rights
+                        .into_iter()
+                        .map(map_machine_right_to_host)
+                        .collect(),
+                })
+            }
         })
         .collect()
+}
+
+fn map_machine_right_to_host(right: programs::MachineRight) -> host_programs::MachineRight {
+    match right {
+        programs::MachineRight::ControlProcessors => host_programs::MachineRight::ControlProcessors,
+    }
 }
 
 fn map_filesystem_right_to_host(
@@ -764,6 +829,50 @@ fn convert_kill_error(error: host_instances::KillError) -> instances::KillError 
     match error {
         host_instances::KillError::NoSuchInstance => instances::KillError::NoSuchInstance,
         host_instances::KillError::AlreadyStopping => instances::KillError::AlreadyStopping,
+    }
+}
+
+fn convert_processor_sets(sets: host_processors::ProcessorSets) -> processors::ProcessorSets {
+    processors::ProcessorSets {
+        possible: sets.possible,
+        bootstrap: sets.bootstrap,
+        online: sets.online,
+    }
+}
+
+fn convert_offline_error(error: host_processors::OfflineError) -> processors::OfflineError {
+    use host_processors::OfflineError as Host;
+    use processors::OfflineError as Wire;
+
+    match error {
+        Host::NotPossible(possible) => Wire::NotPossible(possible),
+        Host::Bootstrap => Wire::Bootstrap,
+        Host::CurrentProcessor => Wire::CurrentProcessor,
+        Host::NotOnline => Wire::NotOnline,
+        Host::Refused(refusal) => Wire::Refused(convert_offline_refusal(refusal)),
+        Host::Denied => Wire::Denied,
+    }
+}
+
+fn convert_offline_refusal(refusal: host_processors::OfflineRefusal) -> processors::OfflineRefusal {
+    match refusal {
+        host_processors::OfflineRefusal::PinnedTasks(live) => {
+            processors::OfflineRefusal::PinnedTasks(live)
+        }
+        host_processors::OfflineRefusal::NetworkStarting => {
+            processors::OfflineRefusal::NetworkStarting
+        }
+    }
+}
+
+fn convert_online_error(error: host_processors::OnlineError) -> processors::OnlineError {
+    use host_processors::OnlineError as Host;
+    use processors::OnlineError as Wire;
+
+    match error {
+        Host::NotPossible(possible) => Wire::NotPossible(possible),
+        Host::NotOffline => Wire::NotOffline,
+        Host::Denied => Wire::Denied,
     }
 }
 

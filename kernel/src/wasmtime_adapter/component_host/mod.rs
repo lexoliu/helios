@@ -973,6 +973,20 @@ macro_rules! impl_authority_conversion {
                             .map_err(map_process_authority_error)?;
                         authority.grant_diagnostic_rights(rights);
                     }
+                    $bindings::helios::system::programs::CapabilityGrant::Machine(machine) => {
+                        let mut rights = crate::MachineAuthorityRights::empty();
+                        for right in machine.rights {
+                            rights |= match right {
+                                $bindings::helios::system::programs::MachineRight::ControlProcessors => {
+                                    crate::MachineAuthorityRights::CONTROL_PROCESSORS
+                                }
+                            };
+                        }
+                        let rights = caller_authority
+                            .derive_machine_rights(rights)
+                            .map_err(map_process_authority_error)?;
+                        authority.grant_machine_rights(rights);
+                    }
                 }
             }
             Ok(authority)
@@ -1655,7 +1669,9 @@ fn map_process_authority_error(error: ProcessAuthorityError) -> crate::ProgramEx
         | ProcessAuthorityError::DeviceNameTooLong
         | ProcessAuthorityError::TooManyDeviceGrants
         | ProcessAuthorityError::EmptyDiagnosticRights
-        | ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_) => {
+        | ProcessAuthorityError::DiagnosticGrantExceedsAuthority(_)
+        | ProcessAuthorityError::EmptyMachineRights
+        | ProcessAuthorityError::MachineGrantExceedsAuthority(_) => {
             crate::ProgramExecErrorKind::PermissionDenied
         }
     };
@@ -1705,11 +1721,14 @@ where
 /// program can be handed only what its launcher holds, and the inspector
 /// session runs desktop, input and audio programs through it. It holds
 /// the observation right for the same reason: the inspector session
-/// runs `perf` through it.
+/// runs `perf` through it. It holds the control-processors right both
+/// for its own `helios:system/processors` RPC and because the session
+/// runs `cpu` through it.
 fn debugger_authority() -> ProcessAuthority {
     let mut authority = ProcessAuthority::root();
     authority.grant_device_classes(DeviceClassRights::all());
     authority.grant_diagnostic_rights(DiagnosticAuthorityRights::OBSERVE_MACHINE);
+    authority.grant_machine_rights(crate::MachineAuthorityRights::CONTROL_PROCESSORS);
     authority
 }
 
@@ -1953,6 +1972,7 @@ where
     service::add_surface_to_linker(linker)?;
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
+    service::add_processors_to_linker(linker)?;
     add_instances_to_linker(linker)?;
     add_snapshot_to_linker(linker)?;
     add_tracing_to_linker(linker)?;
@@ -2157,6 +2177,7 @@ where
     service::add_surface_to_linker(linker)?;
     service::add_gpu_to_linker(linker)?;
     service::add_audio_to_linker(linker)?;
+    service::add_processors_to_linker(linker)?;
     add_tracing_to_program_linker(linker)?;
     program_profiling::add_to_linker(linker)?;
     Ok(())

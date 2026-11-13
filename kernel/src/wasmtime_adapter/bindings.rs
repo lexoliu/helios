@@ -284,6 +284,35 @@ pub mod audio {
     }
 }
 
+/// Bindings for the interface a program reaches the machine's processor
+/// lifecycle through.
+///
+/// Generated from the `processors-host` world, for the reason
+/// `audio-host` is: the kernel implements this one interface for both
+/// program worlds, and the program bindings above already provide every
+/// `wasi:cli` import a caller also has.
+pub mod processors {
+    pub mod bindings {
+        use wasmtime;
+
+        wasmtime::component::bindgen!({
+            path: "../wit",
+            world: "processors-host",
+            imports: {
+                // The transitions are `async func` in the WIT and are
+                // generated against the store on their own account;
+                // reading the sets is two atomic loads per processor
+                // and answers without waiting.
+                default: trappable,
+            },
+            // The answers are compared case for case where the
+            // lifecycle's results are mapped onto them.
+            additional_derives: [PartialEq, Eq],
+            require_store_data_send: true,
+        });
+    }
+}
+
 /// Bindings for the export the compositor plugin answers on.
 ///
 /// Generated from the `compositor-host` world rather than from
