@@ -927,11 +927,12 @@ where
     ) -> Result<TcpReadProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self.inner.state.with_handle_receive_drain(
-            stream,
-            self.inner.device.queue_pair_count().max(1),
-            |state| state.poll_tcp_read(stream, max_bytes, now),
-        )?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.pairs, |state| {
+                    state.poll_tcp_read(stream, max_bytes, now)
+                })?;
         self.record_tcp_read_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -944,11 +945,12 @@ where
     ) -> Result<TcpReadIntoProgress, TcpError> {
         let started = self.profile_start();
         let now = StackInstant::from_nanos(self.now_nanos());
-        let read = self.inner.state.with_handle_receive_drain(
-            stream,
-            self.inner.device.queue_pair_count().max(1),
-            |state| state.poll_tcp_read_into(stream, buffer, now),
-        )?;
+        let read =
+            self.inner
+                .state
+                .with_handle_receive_drain(stream, &self.inner.pairs, |state| {
+                    state.poll_tcp_read_into(stream, buffer, now)
+                })?;
         self.record_tcp_read_into_progress(profile_prefix, started, &read);
         Ok(read)
     }
@@ -1163,9 +1165,11 @@ where
     ///
     /// An operation sweeps every pair — it is the stack's whole driver
     /// while it runs — while a pump reclaims only the pair it owns:
-    /// every other pair has a pump of its own parked on it. A pair
-    /// another processor currently holds is skipped either way: that
-    /// processor is draining it, and this poll has nothing to add.
+    /// every other pair has a pump of its own parked on it. The sweep
+    /// covers every pair brought up, live or not, so what a pair held
+    /// when it stopped being live is still collected. A pair another
+    /// processor currently holds is skipped either way: that processor
+    /// is draining it, and this poll has nothing to add.
     fn reclaim_transmit_completions(
         &self,
         budget: usize,
@@ -1322,7 +1326,7 @@ where
         // configuration the control plane is about to push into the
         // shards. Both are interface-wide duties — an operation driving
         // the stack itself keeps them, and of the pumps only the one on
-        // the bootstrap processor's pair does, since a link or
+        // pair 0 does, since a link or
         // configuration event arrives on no pair. That pump also runs
         // the configuration state machines themselves, between the link
         // check that may have restarted them and the publication of
@@ -1479,17 +1483,18 @@ where
         };
         match scope {
             NetworkPollScope::Interface => self.inner.state.for_each(drive_tcp),
-            NetworkPollScope::Pair { pair, .. } => self
-                .inner
-                .state
-                .for_each_on_pair(pair, pair_count, drive_tcp),
+            NetworkPollScope::Pair { pair, .. } => {
+                self.inner
+                    .state
+                    .for_each_on_pair(pair, self.inner.pairs.layout(), drive_tcp)
+            }
         }
         let tcp_finished = self.profile_start();
         if let Some(probe) = tcp_read_probe {
             tcp_read_started = self.profile_start();
             tcp_read = Some(self.inner.state.with_handle_receive_drain(
                 probe.stream,
-                pair_count,
+                &self.inner.pairs,
                 |state| state.poll_tcp_read(probe.stream, probe.max_bytes, now),
             ));
             tcp_read_finished = self.profile_start();

@@ -5,15 +5,19 @@
 //! `NetworkDevice` contract and installs the network service.
 //!
 //! Concurrency contract: the device is brought up on the bootstrap
-//! processor before interrupts are unmasked, and its MSI-X message
-//! targets that processor's local APIC. Afterwards the driver is shared
-//! across processors through `Arc` and is internally synchronised.
+//! processor before interrupts are unmasked; its configuration message
+//! targets that processor's local APIC, and queue pair `i`'s message
+//! processor `i`'s. Afterwards the driver is shared across processors
+//! through `Arc` and is internally synchronised. A pair's message is
+//! retargeted only by `steer_queue_pair`, which the network service
+//! calls from a processor lifecycle step — one at a time, under the
+//! lifecycle's transition lock.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
 
-use helios_hal::io::IoError;
+use helios_hal::io::{IoError, IoResult};
 use helios_hal::watchdog::Watchdog;
 use helios_kernel::{
     ExternalInterruptHandler, InterfaceCapabilities, InterfaceEventMark, Kernel, LinkState,
@@ -27,8 +31,8 @@ use helios_hal::cpu::{Cpu, ProcessorId};
 use crate::X86Cpu;
 use crate::debug_state::RuntimeState;
 use crate::iommu::X86DmaPool;
-use crate::pci::MsixMessage;
 use crate::pci::PciRoot;
+use crate::pci::{MsixMessage, MsixTable};
 
 type X86VirtioNetDevice = VirtioNetDevice<VirtioPciTransport<X86DmaPool>>;
 
@@ -42,6 +46,43 @@ pub(crate) struct VirtioNetworkDevice {
     /// lookup and the handler knows what it was woken for without
     /// scanning anything.
     role: InterruptRole,
+    /// Where each queue pair's message is delivered, for steering.
+    messages: PairMessages,
+}
+
+/// The MSI-X entries the queue pairs raise, and how to point one at a
+/// processor.
+#[derive(Clone)]
+struct PairMessages {
+    cpu: X86Cpu,
+    table: MsixTable,
+    /// Entries with a pair of their own, after the configuration entry:
+    /// pair `i < steered` raises entry `1 + i`, and the pairs past them
+    /// share the last one (`MsixBinding::per_queue_pair`).
+    steered: usize,
+}
+
+impl PairMessages {
+    /// Points `pair`'s message at `processor`'s local APIC.
+    ///
+    /// A pair past the table's own entries shares the last entry with
+    /// the pair that entry is named for (`steered - 1`), and the entry
+    /// follows that pair: the shared tail cannot follow one of its pairs
+    /// without moving the others. With no entry of its own at all
+    /// (`steered == 0`) the function has one shared message, delivered
+    /// to the bootstrap processor, which never goes offline.
+    fn steer(&self, pair: usize, processor: ProcessorId) {
+        if pair >= self.steered {
+            return;
+        }
+        self.table.retarget(
+            1 + pair as u16,
+            MsixMessage {
+                vector: crate::exceptions::NETWORK_QUEUE_INTERRUPT_VECTORS[pair],
+                destination_apic_id: self.cpu.apic_id_of_processor(processor),
+            },
+        );
+    }
 }
 
 /// What a network interrupt message means.
@@ -138,7 +179,13 @@ where
             destination_apic_id: cpu.apic_id_of_processor(ProcessorId::new(index as u16)),
         };
     }
-    let msix = pci.bind_msix_vectors(address, &messages[..=steered]);
+    let table = pci.bind_msix_vectors(address, &messages[..=steered]);
+    let msix = table.first_entry();
+    let pair_messages = PairMessages {
+        cpu: cpu.clone(),
+        table,
+        steered,
+    };
     // A table with nothing left over after the configuration entry
     // cannot steer at all: every structure of the function shares the
     // one message, which is what `shared` describes.
@@ -167,6 +214,7 @@ where
     let configuration = VirtioNetworkDevice {
         inner: device.clone(),
         role: InterruptRole::Configuration,
+        messages: pair_messages.clone(),
     };
     kernel.install_network_interface(debug_state, configuration.clone());
     tracing::info!(
@@ -191,6 +239,7 @@ where
                     VirtioNetworkDevice {
                         inner: device.clone(),
                         role: InterruptRole::QueuePair(pair_idx),
+                        messages: pair_messages.clone(),
                     },
                 )
             })
@@ -226,6 +275,17 @@ impl NetworkDevice for VirtioNetworkDevice {
 
     fn queue_pair_count(&self) -> usize {
         self.inner.queue_pair_count()
+    }
+
+    fn set_active_queue_pairs(&self, pairs: usize) -> IoResult<()> {
+        self.inner.set_active_queue_pairs(pairs)
+    }
+
+    /// Retargets the pair's MSI-X entry at `processor`'s local APIC, and
+    /// records the owner the driver reports for the pair.
+    fn steer_queue_pair(&self, pair: usize, processor: ProcessorId) {
+        self.inner.steer_pair(pair, processor);
+        self.messages.steer(pair, processor);
     }
 
     fn capabilities(&self) -> InterfaceCapabilities {

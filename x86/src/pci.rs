@@ -230,14 +230,14 @@ impl PciRoot {
         vector: u8,
         destination_apic_id: u32,
     ) -> helios_virtio::MsixBinding {
-        let entry = self.bind_msix_vectors(
+        let table = self.bind_msix_vectors(
             address,
             &[MsixMessage {
                 vector,
                 destination_apic_id,
             }],
         );
-        helios_virtio::MsixBinding::shared(entry)
+        helios_virtio::MsixBinding::shared(table.first_entry())
     }
 
     /// Entries in the MSI-X table of `address`, or `None` when the
@@ -265,8 +265,9 @@ impl PciRoot {
     /// `address` at the given vectors and local APICs, and enables MSI-X
     /// on the function.
     ///
-    /// Returns the first table index programmed, which is always zero;
-    /// the caller decides which structure each entry belongs to.
+    /// Returns the programmed table, whose first entry is always zero;
+    /// the caller decides which structure each entry belongs to, and may
+    /// later point one at another processor ([`MsixTable::retarget`]).
     ///
     /// # Concurrency contract
     ///
@@ -274,18 +275,11 @@ impl PciRoot {
     /// programs can fire. The destinations may name secondary
     /// processors that are not started yet: a message to a parked local
     /// APIC is held by it, not lost.
-    pub(crate) fn bind_msix_vectors(&self, address: PciAddress, messages: &[MsixMessage]) -> u16 {
-        assert!(
-            !messages.is_empty(),
-            "PCI function {address} needs at least one MSI-X message"
-        );
-        for message in messages {
-            assert!(
-                message.destination_apic_id <= u32::from(u8::MAX),
-                "MSI-X without interrupt remapping cannot target APIC id {}",
-                message.destination_apic_id
-            );
-        }
+    pub(crate) fn bind_msix_vectors(
+        &self,
+        address: PciAddress,
+        messages: &[MsixMessage],
+    ) -> MsixTable {
         let header = PciHeader::new(address);
         let mut endpoint = EndpointHeader::from_header(header, self.access)
             .unwrap_or_else(|| panic!("PCI function {address} is not an endpoint"));
@@ -315,34 +309,25 @@ impl PciRoot {
 
         let table_offset = usize::try_from(capability.table_offset())
             .unwrap_or_else(|_| panic!("MSI-X table offset for {address} does not fit in usize"));
-        let table = self
+        let base = self
             .map_region(
                 table_bar + table_offset as u64,
                 MSIX_ENTRY_BYTES * messages.len(),
             )
             .unwrap_or_else(|error| panic!("failed to map the MSI-X table of {address}: {error}"))
-            .as_ptr()
             .cast::<u32>();
+        let table = MsixTable {
+            base,
+            entries: u16::try_from(messages.len()).unwrap_or_else(|_| {
+                panic!(
+                    "{} MSI-X messages exceed the table's u16 index",
+                    messages.len()
+                )
+            }),
+        };
 
         for (index, message) in messages.iter().enumerate() {
-            let entry = unsafe { table.byte_add(index * MSIX_ENTRY_BYTES) };
-            let message_address = MSI_ADDRESS_BASE
-                | (u64::from(message.destination_apic_id) << MSI_DESTINATION_SHIFT);
-            unsafe {
-                entry
-                    .byte_add(MSIX_ENTRY_VECTOR_CONTROL)
-                    .write_volatile(MSIX_VECTOR_CONTROL_MASKED);
-                entry
-                    .byte_add(MSIX_ENTRY_ADDRESS_LOW)
-                    .write_volatile(message_address as u32);
-                entry
-                    .byte_add(MSIX_ENTRY_ADDRESS_HIGH)
-                    .write_volatile((message_address >> 32) as u32);
-                entry
-                    .byte_add(MSIX_ENTRY_DATA)
-                    .write_volatile(u32::from(message.vector));
-                entry.byte_add(MSIX_ENTRY_VECTOR_CONTROL).write_volatile(0);
-            }
+            table.write_entry(index as u16, *message);
         }
 
         capability.set_function_mask(false, self.access);
@@ -351,7 +336,85 @@ impl PciRoot {
             capability.enabled(self.access),
             "PCI function {address} refused to enable MSI-X"
         );
+        table
+    }
+}
+
+/// The MSI-X table entries [`PciRoot::bind_msix_vectors`] programmed,
+/// mapped for the kernel's lifetime.
+///
+/// # Concurrency contract
+///
+/// Entries are written at bring-up and afterwards only by
+/// [`Self::retarget`], whose caller serialises it per entry. Every write
+/// masks the entry first and unmasks it last, so the function never
+/// sends a message from a half-written entry; a message it raises while
+/// the entry is masked is held in the entry's pending bit, as MSI-X
+/// per-vector masking requires, and sent to the new destination on the
+/// unmask, so nothing is lost.
+#[derive(Clone, Copy)]
+pub(crate) struct MsixTable {
+    base: NonNull<u32>,
+    entries: u16,
+}
+
+// SAFETY: `base` is a device register window mapped for the kernel's
+// lifetime, and every access to it is a volatile write of one aligned
+// dword to an entry the caller serialises (see the type's contract).
+unsafe impl Send for MsixTable {}
+// SAFETY: as for `Send`: shared handles only ever issue the serialised
+// volatile writes `retarget` makes.
+unsafe impl Sync for MsixTable {}
+
+impl MsixTable {
+    /// The first entry programmed.
+    pub(crate) const fn first_entry(self) -> u16 {
         MSIX_VIRTIO_ENTRY
+    }
+
+    /// Points `entry` at `message` from the next message on, while the
+    /// function runs.
+    pub(crate) fn retarget(self, entry: u16, message: MsixMessage) {
+        assert!(
+            message.destination_apic_id <= u32::from(u8::MAX),
+            "MSI-X without interrupt remapping cannot target APIC id {}",
+            message.destination_apic_id
+        );
+        self.write_entry(entry, message);
+    }
+
+    fn write_entry(self, index: u16, message: MsixMessage) {
+        assert!(
+            index < self.entries,
+            "MSI-X entry {index} is outside the {} entries this table programmed",
+            self.entries
+        );
+        // SAFETY: `index` is inside the window mapped for `entries`
+        // entries of `MSIX_ENTRY_BYTES` each.
+        let entry = unsafe {
+            self.base
+                .as_ptr()
+                .byte_add(usize::from(index) * MSIX_ENTRY_BYTES)
+        };
+        let message_address =
+            MSI_ADDRESS_BASE | (u64::from(message.destination_apic_id) << MSI_DESTINATION_SHIFT);
+        // SAFETY: each offset is an aligned dword register of this
+        // entry, inside the mapped window.
+        unsafe {
+            entry
+                .byte_add(MSIX_ENTRY_VECTOR_CONTROL)
+                .write_volatile(MSIX_VECTOR_CONTROL_MASKED);
+            entry
+                .byte_add(MSIX_ENTRY_ADDRESS_LOW)
+                .write_volatile(message_address as u32);
+            entry
+                .byte_add(MSIX_ENTRY_ADDRESS_HIGH)
+                .write_volatile((message_address >> 32) as u32);
+            entry
+                .byte_add(MSIX_ENTRY_DATA)
+                .write_volatile(u32::from(message.vector));
+            entry.byte_add(MSIX_ENTRY_VECTOR_CONTROL).write_volatile(0);
+        }
     }
 }
 
