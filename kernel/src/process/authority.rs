@@ -1138,8 +1138,7 @@ mod tests {
         ClockAuthorityRights, DeviceClassRights, DiagnosticAuthorityRights,
         DirectoryAuthorityRights, LinkAuthorityRights, MountAuthorityRights,
         NetworkAuthorityRights, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights,
-        SettingsAuthorityRights,
-        TerminalAuthorityRights,
+        SettingsAuthorityRights, TerminalAuthorityRights,
     };
     use crate::device::{DeviceName, MAX_GRANTS};
 
