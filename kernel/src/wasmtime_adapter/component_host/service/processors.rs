@@ -182,6 +182,9 @@ fn offline_refusal(refusal: OfflineRefusal) -> processors_wit::OfflineRefusal {
                 u64::try_from(live).expect("a live task count fits u64"),
             )
         }
+        OfflineRefusal::NetworkStarting { processor: _ } => {
+            processors_wit::OfflineRefusal::NetworkStarting
+        }
     }
 }
 

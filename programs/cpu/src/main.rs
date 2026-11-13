@@ -63,6 +63,10 @@ impl fmt::Display for OfflineReason {
             OfflineError::Refused(OfflineRefusal::PinnedTasks(live)) => {
                 write!(f, "refused: {live} pinned task(s) still run on it")
             }
+            OfflineError::Refused(OfflineRefusal::NetworkStarting) => f.write_str(
+                "refused: the network interface is not up yet, so its queue pair cannot be \
+                 handed off",
+            ),
             OfflineError::Denied => {
                 f.write_str("this program was not granted the right to control processors")
             }

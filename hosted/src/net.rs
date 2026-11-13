@@ -40,6 +40,16 @@ impl NetworkDevice for HostedNetworkDevice {
         match *self {}
     }
 
+    fn set_active_queue_pairs(&self, pairs: usize) -> helios_hal::io::IoResult<()> {
+        let _ = pairs;
+        match *self {}
+    }
+
+    fn steer_queue_pair(&self, pair: usize, processor: helios_hal::cpu::ProcessorId) {
+        let _ = (pair, processor);
+        match *self {}
+    }
+
     fn try_receive_frames_immediate_on<Sink>(
         &self,
         queue_idx: usize,

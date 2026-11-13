@@ -859,6 +859,9 @@ fn convert_offline_refusal(refusal: host_processors::OfflineRefusal) -> processo
         host_processors::OfflineRefusal::PinnedTasks(live) => {
             processors::OfflineRefusal::PinnedTasks(live)
         }
+        host_processors::OfflineRefusal::NetworkStarting => {
+            processors::OfflineRefusal::NetworkStarting
+        }
     }
 }
 

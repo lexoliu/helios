@@ -32,6 +32,10 @@ interface processors {
     /// Tasks pinned to the processor are still alive; their futures
     /// cannot move to another one. Carries how many.
     pinned-tasks(u64),
+    /// The machine has a network interface whose service is not up yet,
+    /// so the queue pair the processor drains cannot be handed off.
+    /// Asked again once the interface is up, the offline proceeds.
+    network-starting,
   }
 
   variant offline-error {

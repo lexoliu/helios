@@ -12,77 +12,27 @@
 //! The window sits in ordinary guest memory, so the bootloader's direct
 //! map reaches it.
 //!
-//! This module finds the device by running the AML interpreter over the
-//! DSDT and every SSDT, checks `_STA`, evaluates `ADDR`, and hands the
-//! window to the machine generation. Which window it is and what a change in it means
-//! are the kernel's and `hal`'s business; this is the discovery only.
+//! This module finds the device in the machine's AML namespace, checks
+//! `_STA`, evaluates `ADDR`, and hands the window to the machine
+//! generation. Which window it is and what a change in it means are the
+//! kernel's and `hal`'s business; this is the discovery only.
 //!
 //! Concurrency contract: discovery runs once on the bootstrap processor
 //! during bring-up, before any secondary starts and before the executor
-//! exists. The interpreter is built, used and dropped here. The window is
-//! never written by the guest.
+//! exists, on the namespace the processor-hotplug task later owns. The
+//! window is never written by the guest.
 
 use core::ptr::NonNull;
-use core::str::FromStr;
 
+use acpi::aml::AmlError;
 use acpi::aml::namespace::{AmlName, NamespaceLevel, NamespaceLevelKind};
 use acpi::aml::object::{DeviceStatus, Object};
-use acpi::aml::op_region::{OpRegion, RegionHandler};
-use acpi::aml::{AmlError, BaseInterpreter};
-use acpi::registers::FixedRegisters;
-use acpi::sdt::SdtHeader;
-use acpi::sdt::fadt::Fadt;
-use acpi::{AcpiTables, AmlTable, PhysicalMapping};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use helios_hal::generation::{GenerationIdAddress, GenerationIdWindow};
 
-use crate::smp::{PhysicalOffsetAcpiHandler, ensure_hhdm_range_mapped};
+use crate::smp::{AcpiNamespace, ensure_hhdm_range_mapped};
 
-/// The region handler type of this backend's AML interpreter.
-///
-/// The backend installs no operation-region handlers, so the
-/// interpreter's region handler type has no values. Naming it keeps the
-/// interpreter free of the `dyn RegionHandler` the `acpi` crate's own
-/// `Interpreter` alias would impose.
-enum NoRegionHandler {}
-
-impl RegionHandler for NoRegionHandler {
-    fn read_u8(&self, _region: &OpRegion) -> Result<u8, AmlError> {
-        match *self {}
-    }
-
-    fn read_u16(&self, _region: &OpRegion) -> Result<u16, AmlError> {
-        match *self {}
-    }
-
-    fn read_u32(&self, _region: &OpRegion) -> Result<u32, AmlError> {
-        match *self {}
-    }
-
-    fn read_u64(&self, _region: &OpRegion) -> Result<u64, AmlError> {
-        match *self {}
-    }
-
-    fn write_u8(&self, _region: &OpRegion, _value: u8) -> Result<(), AmlError> {
-        match *self {}
-    }
-
-    fn write_u16(&self, _region: &OpRegion, _value: u16) -> Result<(), AmlError> {
-        match *self {}
-    }
-
-    fn write_u32(&self, _region: &OpRegion, _value: u32) -> Result<(), AmlError> {
-        match *self {}
-    }
-
-    fn write_u64(&self, _region: &OpRegion, _value: u64) -> Result<(), AmlError> {
-        match *self {}
-    }
-}
-
-/// The AML interpreter this backend builds.
-type Interpreter = BaseInterpreter<PhysicalOffsetAcpiHandler, NoRegionHandler>;
+type Interpreter = AcpiNamespace;
 
 /// `_HID` of QEMU's VM Generation ID device (`hw/acpi/vmgenid.c`).
 const VMGENID_HID: &str = "QEMUVGID";
@@ -108,16 +58,10 @@ pub(crate) struct VmGenerationIdDevice {
 /// running on with no window would leave a restored guest unable to tell
 /// it was restored.
 pub(crate) fn discover(
-    handler: PhysicalOffsetAcpiHandler,
-    rsdp_address: usize,
+    interpreter: &Interpreter,
+    physical_memory_offset: usize,
 ) -> Option<VmGenerationIdDevice> {
-    let physical_memory_offset = handler.physical_memory_offset;
-    // SAFETY: the RSDP address comes from the bootloader's handoff and the
-    // handler maps through the direct map it left in place.
-    let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_address) }
-        .unwrap_or_else(|error| panic!("failed to parse ACPI tables for vmgenid: {error:?}"));
-    let interpreter = load_namespace(&tables, &handler);
-    let device = find_device(&interpreter)?;
+    let device = find_device(interpreter)?;
     // QEMU's `_STA` reports the device not present until firmware has
     // written the window address into the table (`VGIA == 0`). `ADDR`
     // alone cannot tell: it returns that dword plus the GUID offset, so
@@ -175,53 +119,6 @@ pub(crate) fn discover(
     Some(VmGenerationIdDevice { address, window })
 }
 
-/// Loads the DSDT and every SSDT into a fresh AML namespace.
-fn load_namespace(
-    tables: &AcpiTables<PhysicalOffsetAcpiHandler>,
-    handler: &PhysicalOffsetAcpiHandler,
-) -> Interpreter {
-    let fadt = tables
-        .find_table::<Fadt>()
-        .unwrap_or_else(|| panic!("vmgenid: the ACPI tables carry no FADT"));
-    // The interpreter's constructor takes its register block as an `Arc`.
-    // The interpreter and its registers live and die on the bootstrap
-    // processor inside `discover`.
-    let registers = Arc::new(
-        FixedRegisters::new(&fadt, handler.clone())
-            .unwrap_or_else(|error| panic!("vmgenid: FADT fixed registers: {error:?}")),
-    );
-    let dsdt = tables
-        .dsdt()
-        .unwrap_or_else(|error| panic!("vmgenid: the ACPI tables carry no DSDT: {error:?}"));
-    let interpreter = Interpreter::new(handler.clone(), dsdt.revision, registers, None);
-    load_table(&interpreter, handler, dsdt);
-    for ssdt in tables.ssdts() {
-        load_table(&interpreter, handler, ssdt);
-    }
-    interpreter
-}
-
-fn load_table(interpreter: &Interpreter, handler: &PhysicalOffsetAcpiHandler, table: AmlTable) {
-    let header_bytes = core::mem::size_of::<SdtHeader>();
-    // SAFETY: the address and length come from a table header the `acpi`
-    // crate already validated, and the mapping is the direct physical map
-    // the bootloader left in place.
-    let mapping = unsafe {
-        PhysicalMapping::<_, u8>::new(table.phys_address, table.length as usize, handler.clone())
-    };
-    // SAFETY: the mapping covers `table.length` bytes and outlives the
-    // slice, which is dropped when `load_table` returns.
-    let stream = unsafe {
-        core::slice::from_raw_parts(
-            mapping.as_ptr().add(header_bytes),
-            table.length as usize - header_bytes,
-        )
-    };
-    interpreter
-        .load_table(stream)
-        .unwrap_or_else(|error| panic!("vmgenid: loading an AML table failed: {error:?}"));
-}
-
 /// The device whose `_HID` or `_CID` names the VM Generation ID.
 fn find_device(interpreter: &Interpreter) -> Option<AmlName> {
     let mut devices = Vec::new();
@@ -251,7 +148,6 @@ fn names_id(interpreter: &Interpreter, device: &AmlName, segment: &str, expected
 }
 
 fn child(device: &AmlName, segment: &str) -> AmlName {
-    AmlName::from_str(segment)
-        .and_then(|segment| segment.resolve(device))
+    helios_acpi::namespace::child(device, segment)
         .unwrap_or_else(|error: AmlError| panic!("vmgenid: naming {device}.{segment}: {error:?}"))
 }

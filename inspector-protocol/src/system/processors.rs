@@ -141,6 +141,17 @@ mod tests {
         for (position, error) in (0_u8..).zip(offline) {
             round_trip::<Result<(), OfflineError>>(&Err(error), &[1, position]);
         }
+        // `refused` is case 4; its refusal's own index follows.
+        let refusals = [
+            OfflineRefusal::PinnedTasks(3),
+            OfflineRefusal::NetworkStarting,
+        ];
+        for (position, refusal) in (0_u8..).zip(refusals) {
+            round_trip::<Result<(), OfflineError>>(
+                &Err(OfflineError::Refused(refusal)),
+                &[1, 4, position],
+            );
+        }
 
         let online = [
             OnlineError::NotPossible(4),
