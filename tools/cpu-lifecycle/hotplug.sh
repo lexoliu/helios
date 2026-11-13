@@ -24,6 +24,7 @@ set -euo pipefail
 inspector="${1:?inspector binary}"
 runtime="${2:?runtime directory}"
 shift 2
+vm_options=("$@")
 
 accel="${HELIOS_ACCEL:-kvm}"
 read -r -a profile <<<"${HELIOS_VM_PROFILE---release}"
@@ -73,6 +74,37 @@ qmp() {
     jq -c .return <<<"$reply"
 }
 
+# What the guest was doing when a wait on it expired, kept in the
+# runtime directory beside the serial capture: QEMU's vCPU list
+# (`query-cpus-fast.json`); the inspector's capture over the same QMP
+# socket (`vcpu-state.log`: every vCPU's registers, local APIC and
+# stacks), which also names on stderr the kernel function each vCPU is
+# in and the return addresses on its stacks; and, on a Linux host, the
+# debug serial socket's queues (`debug-socket.txt`), since a guest
+# writing to a line nobody drains stops with the host's queue full.
+#   dump_guest <what>
+dump_guest() {
+    local what="$1" sockets
+    if [ -z "$sock" ]; then
+        echo "cpu-hotplug: QMP never answered; no vCPU state to capture" >&2
+        return
+    fi
+    if (qmp query-cpus-fast) >"$runtime/query-cpus-fast.json"; then
+        echo "cpu-hotplug: query-cpus-fast: $(cat "$runtime/query-cpus-fast.json")" >&2
+    fi
+    "$inspector" vm --arch x86-64 "${profile[@]}" --runtime-dir "$runtime" \
+        "${vm_options[@]}" vcpu-state --after "the check's wait for $what" ||
+        echo "cpu-hotplug: the inspector's vCPU capture failed" >&2
+    if command -v ss >/dev/null; then
+        sockets="$(dirname "$sock")"
+        {
+            echo "ss -xpn, the sockets of $sockets and their peers:"
+            ss -xpn | grep -e '^Netid' -e "$sockets" -e qemu -e helios-insp || true
+        } >"$runtime/debug-socket.txt"
+        cat "$runtime/debug-socket.txt" >&2
+    fi
+}
+
 # Runs `check` once a second until it succeeds or `limit` seconds pass.
 #   wait_for <limit> <what> <check command...>
 wait_for() {
@@ -82,7 +114,10 @@ wait_for() {
         kill -0 "$inspector_pid" 2>/dev/null ||
             fail "the inspector exited while waiting for $what"
         waited=$((waited + 1))
-        test "$waited" -le "$limit" || fail "timed out waiting for $what"
+        if [ "$waited" -gt "$limit" ]; then
+            dump_guest "$what"
+            fail "timed out waiting for $what"
+        fi
         sleep 1
     done
 }
@@ -137,7 +172,7 @@ exec 3<>"$fifo"
     --runtime-dir "$runtime" --keep-runtime-dir \
     --boot-program dash --boot-program debugger --boot-program cpu \
     --no-compiler-plugin \
-    "$@" \
+    "${vm_options[@]}" \
     repl <&3 2>"$runtime/inspector.log" >"$out" &
 inspector_pid=$!
 
