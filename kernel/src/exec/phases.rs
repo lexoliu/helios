@@ -245,7 +245,9 @@ impl LaunchEnd {
     /// program itself is a refusal.
     pub(crate) fn of(kind: ProgramExecErrorKind) -> Self {
         match kind {
-            ProgramExecErrorKind::OutOfMemory | ProgramExecErrorKind::Internal => Self::Failed,
+            ProgramExecErrorKind::OutOfMemory
+            | ProgramExecErrorKind::Internal
+            | ProgramExecErrorKind::Io => Self::Failed,
             _ => Self::Refused,
         }
     }
@@ -400,13 +402,32 @@ impl Timeline {
     /// when the target is enabled: off means no clock is read and no
     /// timeline allocated.
     pub(crate) fn begin<CpuImpl: Cpu>(cpu: &CpuImpl, op: &'static str, program: &str) -> Self {
+        Self::begin_with(op, program, || monotonic_nanos(cpu))
+    }
+
+    /// Begins a launch's timeline whose `rpc-arrival` is a reading the
+    /// caller already took, so the timeline and a [`LaunchClock`] share
+    /// one epoch.
+    fn begin_at(op: &'static str, program: &str, arrival_ns: u64) -> Self {
+        Self::begin_with(op, program, || arrival_ns)
+    }
+
+    fn begin_with(op: &'static str, program: &str, arrival_ns: impl FnOnce() -> u64) -> Self {
         let inner = gated(|| Arc::new(LaunchTimeline::new(op, String::from(program))));
         if let Some(timeline) = &inner {
-            timeline.stamp(LaunchPhase::RpcArrival, monotonic_nanos(cpu));
+            timeline.stamp(LaunchPhase::RpcArrival, arrival_ns());
         }
         Self {
             inner,
             task_emits: false,
+        }
+    }
+
+    /// Records `phase` at a reading the caller already took — a no-op
+    /// on a disabled timeline.
+    fn record_at(&self, phase: LaunchPhase, at_ns: u64) {
+        if let Some(timeline) = &self.inner {
+            timeline.stamp(phase, at_ns);
         }
     }
 
@@ -550,6 +571,31 @@ impl<CpuImpl: Cpu> Drop for TaskTrace<CpuImpl> {
     }
 }
 
+/// The kernel monotonic reading a launch call arrived at, taken for a
+/// call whose reply carries the launch's own duration
+/// (`programs.exec`'s `launch-nanos`).
+///
+/// Unlike the timeline, which reads no clock while its target is off,
+/// this reading is taken on every such launch: the duration is part of
+/// the reply's contract, not a diagnosis somebody enabled. It is the
+/// same clock the timeline stamps, and [`Trace::begin_timed`] stamps
+/// `rpc-arrival` from it, so the duration and the line agree.
+///
+/// Owned by the launch-call task and never shared, so it is a plain
+/// value.
+pub(crate) struct LaunchClock {
+    arrival_ns: u64,
+}
+
+impl LaunchClock {
+    /// Reads the arrival now.
+    pub(crate) fn arrive<CpuImpl: Cpu>(cpu: &CpuImpl) -> Self {
+        Self {
+            arrival_ns: monotonic_nanos(cpu),
+        }
+    }
+}
+
 /// The launch-call task's end of a [`Timeline`]: emits the line on
 /// drop unless [`disarm`](Self::disarm) hands emission to the run task.
 /// Holding one for the duration of a launch call makes every early
@@ -571,6 +617,33 @@ impl<CpuImpl: Cpu> Trace<CpuImpl> {
             cpu,
             emit_on_drop: true,
         }
+    }
+
+    /// Begins a launch whose reply reports its own duration: the
+    /// timeline's `rpc-arrival`, when the target is enabled, is the
+    /// `clock`'s arrival reading, so the duration
+    /// [`replied`](Self::replied) returns and the line's `reply_ns`
+    /// measure one interval.
+    pub(crate) fn begin_timed(
+        cpu: CpuImpl,
+        op: &'static str,
+        program: &str,
+        clock: &LaunchClock,
+    ) -> Self {
+        Self {
+            timeline: Timeline::begin_at(op, program, clock.arrival_ns),
+            cpu,
+            emit_on_drop: true,
+        }
+    }
+
+    /// Records `reply` and returns the launch's duration in
+    /// nanoseconds since `clock`'s arrival: one clock reading serves
+    /// both, so the reported duration is the line's `reply_ns`.
+    pub(crate) fn replied(&self, clock: &LaunchClock) -> u64 {
+        let replied_ns = monotonic_nanos(&self.cpu);
+        self.timeline.record_at(LaunchPhase::Reply, replied_ns);
+        replied_ns - clock.arrival_ns
     }
 
     /// Re-arms the emit-on-drop guard around a `Timeline` another
@@ -889,6 +962,55 @@ mod tests {
         assert!(line.contains("error_kind=internal"), "line was: {line}");
         assert!(line.contains("guest_end_ns=0"), "line was: {line}");
         assert!(!line.contains("completion_ns"), "line was: {line}");
+    }
+
+    /// A timed launch's duration is the interval its line brackets:
+    /// `replied` returns exactly the `reply_ns` the line carries, because
+    /// the arrival and the reply are each one clock reading shared by
+    /// both.
+    #[test]
+    fn a_timed_launch_reports_the_lines_reply_offset() {
+        use super::{LaunchClock, Trace};
+        use crate::test_support::TestCpu;
+
+        let lines = alloc::sync::Arc::new(Capture {
+            lines: std::sync::Mutex::new(alloc::vec::Vec::new()),
+        });
+        let captured = lines.clone();
+        let launch_nanos = tracing::subscriber::with_default(captured, || {
+            let cpu = TestCpu::without_entropy();
+            let clock = LaunchClock::arrive(&cpu);
+            let trace = Trace::begin_timed(cpu, "exec", "/bin/python3", &clock);
+            trace.replied(&clock)
+        });
+
+        let lines = lines.lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "one launch emits one line");
+        let line = &lines[0];
+        assert!(line.contains("rpc_arrival_ns=0"), "line was: {line}");
+        assert!(
+            line.contains(&alloc::format!("reply_ns={launch_nanos}")),
+            "line was: {line}"
+        );
+    }
+
+    /// A timed launch reads its clock whether or not the phase target
+    /// is enabled: the duration belongs to the reply, not to the
+    /// diagnosis.
+    #[test]
+    fn a_timed_launch_measures_with_the_target_off() {
+        use super::{LaunchClock, Trace};
+        use crate::test_support::TestCpu;
+
+        let cpu = TestCpu::without_entropy();
+        let clock = LaunchClock::arrive(&cpu);
+        let trace = Trace::begin_timed(cpu, "exec", "/bin/python3", &clock);
+        let before = super::monotonic_nanos(&cpu);
+        let launch_nanos = trace.replied(&clock);
+        assert!(
+            launch_nanos >= before - clock.arrival_ns,
+            "the duration ends after a reading taken before the reply"
+        );
     }
 
     /// A run that produced a child exit ends its line `completed` —

@@ -13,7 +13,6 @@ helios-compiler-support.workspace = true
 helios-profdata.workspace = true
 helios-venus-gen.workspace = true
 helios-workspace-root.workspace = true
-hex = "0.4.3"
 mbrman = "0.5.4"
 # Writes the kernel image onto the boot disk without its DWARF (#451).
 object = { version = "0.39", default-features = false, features = ["build", "std"] }

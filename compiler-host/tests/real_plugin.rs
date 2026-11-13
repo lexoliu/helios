@@ -5,6 +5,7 @@
 
 use std::num::NonZeroU32;
 
+use helios_artifact::cwasm_target_isa_levels;
 use helios_compiler_abi::{CompileHint, OutputKind};
 use helios_compiler_host::{CompilerHost, CompilerHostError, on_wasm_thread};
 use wasmtime::{Engine, Precompiled};
@@ -22,9 +23,10 @@ fn the_real_plugin_compiles_a_module_for_this_host() {
         .expect("the input assembles");
     let target = target_lexicon::HOST.to_string();
     let workers = NonZeroU32::new(2).expect("two workers");
+    let isa_level = cwasm_target_isa_levels(&target).floor().name();
     let compiled = on_wasm_thread(move || -> Result<_, CompilerHostError> {
         let mut host = CompilerHost::new(&plugin, workers)?;
-        host.compile(&input, &target, CompileHint::Performance)
+        host.compile(&input, &target, isa_level, CompileHint::Performance)
     })
     .expect("the driver thread runs")
     .expect("the plugin compiles the module");

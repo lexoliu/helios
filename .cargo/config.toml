@@ -20,4 +20,12 @@ rustflags = [
   # ARMv8.4 LSE2 lifts alignment requirements on atomics. Apple
   # Silicon, Ampere Altra, AWS Graviton 2+ all support this baseline.
   "-C", "target-feature=+lse,+rcpc,+lse2",
+  # Every function that saves LR signs it (`paciasp`/`autiasp`, HINT-space
+  # encodings that do nothing until the kernel enables the key on a
+  # processor). rustc treats the flag as a target modifier, so `core`,
+  # `alloc` and `compiler_builtins` must carry it too: every build of this
+  # target passes `-Zbuild-std=core,alloc` (the Justfile's `check-target` and
+  # `clippy-target`, the inspector's kernel build). `aarch64/build.rs` refuses
+  # to compile the backend without this flag.
+  "-Zbranch-protection=pac-ret",
 ]

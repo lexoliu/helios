@@ -44,14 +44,16 @@ pub(crate) fn has_balloon_device(platform: &PlatformDescription) -> bool {
     crate::count_virtio_mmio_devices(platform, helios_virtio::DeviceType::MemoryBalloon) != 0
 }
 
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &Kernel<crate::Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
+    generation: helios_kernel::MachineGenerationHandle,
 ) -> Option<BalloonInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let candidate = crate::virtio_slots(
         platform,
@@ -79,7 +81,7 @@ where
                 )
             });
     let device = Arc::new(device);
-    let handle = helios_kernel::install_memory_balloon(kernel, device.clone());
+    let handle = helios_kernel::install_memory_balloon(kernel, device.clone(), generation);
     tracing::info!("virtio balloon online interrupt={interrupt:?}");
     Some(BalloonInterrupt {
         interrupt,

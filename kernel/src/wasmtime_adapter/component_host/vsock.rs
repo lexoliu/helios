@@ -185,14 +185,14 @@ impl VsockBindings for ProgramVsock {
 /// machine's device have both been checked.
 type Authorised<Bindings> = Result<ComponentHostVsockService, <Bindings as VsockBindings>::Error>;
 
-fn authorise<Bindings, CpuImpl, Net, HostFs>(
-    store: &StoreData<CpuImpl, Net, HostFs>,
+fn authorise<Bindings, CpuImpl, Net, StorageImpl>(
+    store: &StoreData<CpuImpl, Net, StorageImpl>,
 ) -> Authorised<Bindings>
 where
     Bindings: VsockBindings,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if store.debug_port().is_none() {
         return Err(denied::<Bindings>());
@@ -203,14 +203,14 @@ where
         .ok_or_else(unavailable::<Bindings>)
 }
 
-pub(super) fn add_vsock_to_linker<Bindings, CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(super) fn add_vsock_to_linker<Bindings, CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     Bindings: VsockBindings,
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let mut instance = linker.instance(VSOCK_INSTANCE)?;
     instance.resource_concurrent(
@@ -250,7 +250,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "guest-cid",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (): ()| {
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (): ()| {
             Box::pin(async move {
                 let cid = accessor.with(|mut access| {
                     let store = access.get();
@@ -267,7 +267,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "listen",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>, (port, backlog): (u32, u32)| {
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>, (port, backlog): (u32, u32)| {
             Box::pin(async move {
                 let response = accessor.with(|mut access| {
                     let service = match authorise::<Bindings, _, _, _>(access.get()) {
@@ -291,7 +291,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "connect",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (address, timeout): (Bindings::Address, u64)| {
             Box::pin(async move {
                 let peer = Bindings::to_address(&address);
@@ -320,7 +320,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-listener.port",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
             Box::pin(async move {
                 let response = accessor.with(|mut access| {
@@ -338,7 +338,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-listener.accept",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, timeout): (Resource<ComponentVsockListener>, u64)| {
             Box::pin(async move {
                 let listener = accessor.with(|mut access| {
@@ -366,7 +366,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-listener.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockListener>,)| {
             Box::pin(async move {
                 let response = accessor.with(|mut access| {
@@ -384,7 +384,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.peer",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
             Box::pin(async move {
                 let response = accessor.with(|mut access| {
@@ -403,7 +403,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.read",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, max_bytes, timeout): (Resource<ComponentVsockStream>, u32, u64)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {
@@ -429,7 +429,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.write",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource, bytes, timeout): (Resource<ComponentVsockStream>, Vec<u8>, u64)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {
@@ -453,7 +453,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.shutdown-send",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {
@@ -477,7 +477,7 @@ where
     )?;
     instance.func_wrap_concurrent(
         "[method]vsock-stream.close",
-        |accessor: &Accessor<StoreData<CpuImpl, Net, HostFs>>,
+        |accessor: &Accessor<StoreData<CpuImpl, Net, StorageImpl>>,
          (resource,): (Resource<ComponentVsockStream>,)| {
             Box::pin(async move {
                 let stream = accessor.with(|mut access| {

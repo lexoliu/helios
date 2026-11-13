@@ -1,7 +1,7 @@
 //! Async-first userland SDK for Helios wasm programs.
 //!
 //! Each capability area lives behind a Cargo feature so programs only
-//! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `io`,
+//! link the WIT interfaces they use: `fs`, `http`, `http-handler`, `http-kit-io`, `io`,
 //! `mounts`, `net`, `programs`, `serial`, `stats`, `sync`, `task`, `tracing`,
 //! `profiling`, `instances`, `display`, `gpu`, `input`, `surface`,
 //! `compositor`, `audio`, `vsock`, and `channel`. `bindings` exposes the raw generated WIT
@@ -25,6 +25,8 @@ pub mod fs;
 pub mod gpu;
 #[cfg(feature = "http")]
 pub mod http;
+#[cfg(feature = "http-kit-io")]
+pub mod http_kit;
 #[cfg(feature = "input")]
 pub mod input;
 #[cfg(feature = "instances")]

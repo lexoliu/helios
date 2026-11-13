@@ -48,8 +48,8 @@ pub(crate) fn has_sound_device(platform: &PlatformDescription) -> bool {
 }
 
 /// Brings the platform's sound device up and hands it to the kernel.
-pub(crate) fn install<WatchdogImpl>(
-    kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl>,
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
+    kernel: &helios_kernel::Kernel<crate::Aarch64Cpu, WatchdogImpl, MeasuredBootImpl>,
     platform: &PlatformDescription,
     physical_memory_offset: usize,
     handoff: &crate::LimineBootHandoff,
@@ -57,6 +57,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Option<SoundInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let sound = discover_sound_device(platform, physical_memory_offset, handoff)?;
     let service = helios_kernel::install_audio_device(kernel, sound.device.device.clone());

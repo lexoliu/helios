@@ -252,7 +252,7 @@ mod tests {
         let shown: alloc::vec::Vec<_> = changes
             .iter()
             .filter_map(|change| match change {
-                MappingChange::SubstituteDevice(virt) => Some(*virt),
+                MappingChange::SubstituteDevice(virt, _) => Some(*virt),
                 _ => None,
             })
             .collect();

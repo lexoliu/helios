@@ -10,10 +10,10 @@ use super::{
 };
 use crate::{
     BootFs, ComponentFsPathError, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs,
-    MountCap, ProcessAuthority, UnsupportedHostFileSystem, resolve_child_path,
+    MountCap, ProcessAuthority, UnsupportedStorage, resolve_child_path,
 };
 
-type TestNamespace = Namespace<UnsupportedHostFileSystem>;
+type TestNamespace = Namespace<UnsupportedStorage>;
 
 const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
     &[EmbeddedBootDirectory::new("mnt", 0)],
@@ -26,8 +26,16 @@ fn namespace() -> TestNamespace {
     Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE), 1))
 }
 
-fn memory(namespace: &TestNamespace) -> MountedFs<UnsupportedHostFileSystem> {
+fn memory(namespace: &TestNamespace) -> MountedFs<UnsupportedStorage> {
     MountedFs::Memory(MemoryFs::new(namespace.table().allocate_device()))
+}
+
+/// A machine with neither a host share nor a disk.
+fn nothing_attached() -> crate::AttachedStorage<UnsupportedStorage> {
+    crate::AttachedStorage {
+        host_share: None,
+        disks: None,
+    }
 }
 
 fn cap(point: &str) -> MountCap {
@@ -459,11 +467,11 @@ fn a_mount_request_without_mount_authority_is_refused() {
         .expect("valid preopen"),
     );
 
-    assert_eq!(
+    assert!(matches!(
         block_on(crate::request_mount(
             &authority,
             &namespace,
-            None,
+            nothing_attached(),
             crate::MountSource::Memory,
             "/mnt",
             false,
@@ -473,7 +481,7 @@ fn a_mount_request_without_mount_authority_is_refused() {
                 crate::MountAuthorityRights::MOUNT
             )
         ))
-    );
+    ));
     assert_eq!(owner(&namespace, "/mnt/x").0, "/");
 }
 
@@ -485,7 +493,7 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
     block_on(crate::request_mount(
         &authority,
         &namespace,
-        None,
+        nothing_attached(),
         crate::MountSource::BootImage,
         "/mnt",
         false,
@@ -501,17 +509,29 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
         Err(FsError::ReadOnly)
     );
 
-    assert_eq!(
+    assert!(matches!(
         block_on(crate::request_mount(
             &authority,
             &namespace,
-            None,
+            nothing_attached(),
             crate::MountSource::HostShare,
             "/mnt",
             false,
         )),
         Err(crate::MountRequestError::HostShareUnavailable)
-    );
+    ));
+    let serial = helios_hal::fs::BlockSerial::new(b"absent").expect("serial fits");
+    assert!(matches!(
+        block_on(crate::request_mount(
+            &authority,
+            &namespace,
+            nothing_attached(),
+            crate::MountSource::Disk { serial },
+            "/mnt",
+            true,
+        )),
+        Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial
+    ));
 
     block_on(crate::request_unmount(&authority, &namespace, "/mnt")).expect("unmounts");
     assert_eq!(owner(&namespace, "/mnt/bin/tool").0, "/");
