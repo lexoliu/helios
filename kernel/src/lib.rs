@@ -1305,6 +1305,15 @@ where
     }
     kernel.bring_up();
     let processor_id = current_processor.id();
+    if current_processor == topology.bootstrap_processor {
+        // The possible set, of which the `Processor online` lines name
+        // the members that came up: a platform can list processors that
+        // are not present until a hot-add starts them.
+        let possible = topology.configured_processors;
+        kernel.spawn_detached(async move {
+            tracing::info!("Processor topology possible={possible}");
+        });
+    }
     kernel.spawn_detached(async move {
         tracing::info!("Processor online processor={processor_id}");
     });
