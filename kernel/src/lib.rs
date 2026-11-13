@@ -988,10 +988,21 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     }
 
     pub fn run_until_stalled_with_stats(&self) -> KernelRunStats {
+        self.run_until_stalled_with_steps(&())
+    }
+
+    /// [`Self::run_until_stalled_with_stats`] for a run loop whose layer
+    /// owns per-processor state of its own: `steps` goes down first and
+    /// comes up last when this processor goes offline and back
+    /// (`exec::lifecycle`).
+    pub(crate) fn run_until_stalled_with_steps<Steps: exec::ProcessorStep>(
+        &self,
+        steps: &Steps,
+    ) -> KernelRunStats {
         // Every run loop comes through here between tasks, holding
         // nothing, which is where a processor asked to go offline tears
         // itself down and stops.
-        self.service_lifecycle();
+        self.service_lifecycle(steps);
         // The page-fault path that commits a fiber stack page takes its
         // frame from this processor's reserve and may not wait on the
         // pool's lock to refill it, so the refill happens here instead:
@@ -1033,8 +1044,14 @@ impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: Mea
     }
 
     pub fn run(&self) -> ! {
+        self.run_with_steps(&())
+    }
+
+    /// [`Self::run`] for a run loop whose layer owns per-processor state
+    /// of its own, as [`Self::run_until_stalled_with_steps`] describes.
+    pub(crate) fn run_with_steps<Steps: exec::ProcessorStep>(&self, steps: &Steps) -> ! {
         loop {
-            if self.run_until_stalled() == 0 {
+            if self.run_until_stalled_with_steps(steps).progress_count() == 0 {
                 self.park_until_work();
             }
         }
