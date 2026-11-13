@@ -826,3 +826,25 @@ def test_a_foreign_label_and_other_events_still_decide_as_before(jobs):
     assert evaluate(condition, "pull_request", "opened", labels=["docs"])
     assert evaluate(condition, "push")
     assert evaluate(condition, "workflow_dispatch")
+
+
+def test_release_signs_the_boot_payload_with_the_secret_key_and_removes_it_last():
+    workflow = yaml.load((REPO_ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader)
+    steps = workflow["jobs"]["kernel-profile"]["steps"]
+    names = [step.get("name") for step in steps]
+    install = names.index("Install the release signing key")
+    build = names.index("Build the released kernel against the profile")
+    attach = names.index("Attach the profile, the profile-guided kernel and its boot payload to the release")
+    remove = names.index("Remove the release signing key")
+    assert install < build < attach < remove == len(steps) - 1
+    assert steps[remove]["if"] == "always()"
+    # The secret reaches only the step that decodes it, and the key lands
+    # outside the checkout.
+    assert steps[install]["env"]["HELIOS_BOOTFS_ROOT_KEY"] == "${{ secrets.HELIOS_BOOTFS_ROOT_KEY }}"
+    assert sum("secrets.HELIOS_BOOTFS_ROOT_KEY" in str(step) for step in steps) == 1
+    assert 'key="${RUNNER_TEMP}/' in steps[install]["run"]
+    assert "install -m 600" in steps[install]["run"]
+    assert '--root-secret-key "${HELIOS_ROOT_KEY_FILE}"' in steps[build]["run"]
+    upload = steps[attach]["run"]
+    assert "bootfs-path" in upload
+    assert "assets/helios-bootfs-x86-64 \\" in upload

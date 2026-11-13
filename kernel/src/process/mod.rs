@@ -18,13 +18,14 @@ mod thread;
 pub(crate) use authority::test_caps;
 pub use authority::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, DeviceClassRights, DeviceGrantClaimCap,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap, JoinAuthority, LinkAuthorityRights,
-    LinkSourceCap, LinkTargetDirectoryCap, MountAuthorityRights, MountCap, MulticastCap,
-    NetworkAdminCap, NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority,
-    ProcessAuthorityError, ProcessAuthorityRights, SetWallClockCap, SignalAuthority,
-    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, TtyControlCap, UdpCap, UnmountCap,
+    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
+    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, GpuOpenCap, InputClaimCap,
+    JoinAuthority, LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap,
+    MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap, NetworkAuthorityRights,
+    NetworkCap, ObserveMachineCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
+    ProcessAuthorityRights, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap,
+    TtyControlCap, UdpCap, UnmountCap,
 };
 pub(crate) use descriptor::FreeDescriptorSlots;
 pub use descriptor::{

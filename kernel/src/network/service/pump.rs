@@ -112,18 +112,6 @@ impl NetworkPollScope {
         }
     }
 
-    /// Whether the pair-agnostic async receive fallback is this scope's
-    /// to use. The fallback drains pair zero under its async lock, so
-    /// it belongs to the scope that owns pair zero — every operation,
-    /// and the pump on pair zero — not to a pump whose pair somebody
-    /// else is already draining.
-    pub(super) const fn covers_pair_zero(self) -> bool {
-        match self {
-            Self::Interface => true,
-            Self::Pair { pair, .. } => pair == 0,
-        }
-    }
-
     /// Whether this poll owes the interface's configuration state
     /// machines — the DHCP exchange and router solicitation — a drive.
     /// An operation that is configuring drives them itself through
@@ -259,17 +247,6 @@ impl NetworkPollSource {
         }
     }
 
-    pub(super) const fn rx_fallback_phase(self) -> &'static str {
-        match self {
-            Self::Pump => "rx-fallback-pump",
-            Self::Ping => "rx-fallback-ping",
-            Self::Dns => "rx-fallback-dns",
-            Self::Tcp => "rx-fallback-tcp",
-            Self::Udp => "rx-fallback-udp",
-            Self::Configuration => "rx-fallback-configuration",
-        }
-    }
-
     pub(super) const fn rx_signal_phase(self) -> &'static str {
         match self {
             Self::Pump => "rx-signal-pump",
@@ -333,6 +310,74 @@ pub(super) struct NetworkPumpCadence {
 pub(super) struct NetworkPerfStart {
     pub(super) nanos: u64,
     pub(super) counters: HardwarePerfCounters,
+}
+
+/// Time and hardware counters spent between two profile samples.
+///
+/// A span is what a phase records, and unlike a pair of samples it can
+/// be summed over disjoint intervals and taken out of the interval that
+/// encloses them — which is how a phase that runs in slices inside
+/// another one, like the receive demux inside the device's hold of a
+/// ring, is reported apart from it.
+#[derive(Clone, Copy, Default)]
+pub(super) struct NetworkPerfSpan {
+    pub(super) nanos: u64,
+    pub(super) counters: HardwarePerfCounterDelta,
+}
+
+impl NetworkPerfSpan {
+    /// The span between two samples, or `None` when profiling was off
+    /// for either of them.
+    pub(super) fn between(
+        start: Option<NetworkPerfStart>,
+        end: Option<NetworkPerfStart>,
+    ) -> Option<Self> {
+        let (start, end) = (start?, end?);
+        Some(Self {
+            nanos: end.nanos.saturating_sub(start.nanos),
+            counters: end.counters.delta_since(start.counters),
+        })
+    }
+
+    /// Adds a disjoint interval to this one.
+    pub(super) fn add(&mut self, other: Self) {
+        self.nanos = self.nanos.saturating_add(other.nanos);
+        self.counters = HardwarePerfCounterDelta {
+            reference_cycles: self
+                .counters
+                .reference_cycles
+                .saturating_add(other.counters.reference_cycles),
+            cpu_cycles: self
+                .counters
+                .cpu_cycles
+                .saturating_add(other.counters.cpu_cycles),
+            instructions_retired: self
+                .counters
+                .instructions_retired
+                .saturating_add(other.counters.instructions_retired),
+        };
+    }
+
+    /// This span without `nested`, an interval inside it.
+    pub(super) fn excluding(self, nested: Self) -> Self {
+        Self {
+            nanos: self.nanos.saturating_sub(nested.nanos),
+            counters: HardwarePerfCounterDelta {
+                reference_cycles: self
+                    .counters
+                    .reference_cycles
+                    .saturating_sub(nested.counters.reference_cycles),
+                cpu_cycles: self
+                    .counters
+                    .cpu_cycles
+                    .saturating_sub(nested.counters.cpu_cycles),
+                instructions_retired: self
+                    .counters
+                    .instructions_retired
+                    .saturating_sub(nested.counters.instructions_retired),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

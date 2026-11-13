@@ -18,7 +18,7 @@ never depends on anything above it.
 | Layer | Crates | Contents |
 | --- | --- | --- |
 | Hardware contracts | `hal/` | Traits, capability types and value types only. `#![no_std]`. |
-| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; all three depend on `hal/` and none on the kernel. |
+| Device and protocol libraries | `netstack/`, `virtio/`, `i6300esb/`, `tpm/` | `#![no_std]` protocol engines and drivers. `virtio/` builds on `netstack/`; `tpm/` drives a TPM 2.0 over the FIFO and CRB interfaces for measured boot and sealing only; all four depend on `hal/` and none on the kernel. |
 | Shared ABIs | `compiler-abi/`, `artifact/` | `#![no_std]` wire formats shared by the kernel and host tools: the compiler plugin's request and response headers, `cwasm` target flags, the signature trailer, and the `helios-bootfs` payload image the kernel reads at bring-up. |
 | Kernel | `kernel/` | Every piece of hardware-independent runtime logic: executor, timer, memory and OOM, instance registry, component host, Wasmtime adapter, network service, host-fs client, every WIT service. `#![no_std]`, generic over `Cpu`. The user payload is not linked into the kernel: it arrives as a boot module (`docs/boot.md`). |
 | Backends | `aarch64/`, `riscv/`, `x86/`, `hosted/` | Boot, trap, IRQ, timer, MMIO, UART, virtio transport and SMP wiring, and nothing else. `hosted/` runs the same kernel on the host OS under the same restriction. |
@@ -121,6 +121,8 @@ maintainer's decision and the fork's revision moves once, per §1.
   transport. Replacing any of them with IDE, an emulated legacy device, an
   ad-hoc host file, or other fallback I/O is an architectural change that
   needs explicit approval in the task that proposes it.
+- A TPM 2.0 (`tpm/`) is the one device outside virtio. It carries measured
+  boot and sealing, and never data I/O.
 - A well-maintained, `no_std`-friendly third-party crate beats a hand-rolled
   implementation.
 
@@ -197,9 +199,12 @@ maintainer's decision and the fork's revision moves once, per §1.
   bounds checks, with `memory_init_cow(true)` and `memory_may_move(false)`.
   Disabling any of them needs a same-PR justification of the alternative
   semantic path.
-- Full x86 AVX, FMA and AVX-512 enablement waits on the x86 kernel providing
-  OSXSAVE, XCR0 configuration and XSAVE/XRSTOR state preservation, and is
-  tracked as such.
+- x86 guest code is compiled for the highest ISA level the processor
+  satisfies. The kernel saves no extended vector state: its image carries no
+  VEX or EVEX instruction, and it switches away from guest code only at
+  call boundaries, where the vector registers and k-masks are caller-saved.
+  A change that breaks either property brings XSAVE/XRSTOR preservation
+  with it.
 - Performance decisions rest on bare-metal targets and explicit capabilities,
   never on `hosted/`.
 - A performance test, benchmark, or acceptance measurement runs `--release`
@@ -422,9 +427,11 @@ does.
 
 Before a change is complete, run the recipes for every surface it can
 affect. `just check-target` and `just test-units` run `helios-cli
-kernel-prebuild` themselves and export the two trusted-root key files it
-writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY` and `HELIOS_KERNEL_ROOT_SECRET_KEY`,
-the only prebuild outputs the kernel build tracks; the `helios-bootfs`
+kernel-prebuild` themselves and export the trusted-root public key file it
+writes as `HELIOS_KERNEL_ROOT_PUBLIC_KEY`, the only prebuild output the
+kernel build tracks; a recipe that compiles the kernel's tests also exports
+`HELIOS_KERNEL_ROOT_SECRET_KEY`, which only a test build reads and no
+kernel image is given; the `helios-bootfs`
 payload it also writes is loaded at boot, never compiled in, so changing
 the boot programs never relinks the kernel. The `check-target` set is the
 backends the diff can reach: a change in `hal/`, a library crate, a shared
@@ -445,7 +452,7 @@ just test-units
 `just lint` is `tools/fmt.sh --check`, `cargo deny --workspace check bans`
 against `deny.toml`, and `cargo clippy … -D warnings` over the host crates, each
 guest program, and the three bare-metal targets.
-`just test-units` runs the `hal`, `virtio`, `netstack`, `kernel`,
+`just test-units` runs the `hal`, `virtio`, `netstack`, `tpm`, `kernel`,
 `inspector-protocol` and `workspace-root` unit tests, every `hosted` test,
 and the `hal_layering` test (`kernel/tests/`) that enforces §1. The recipe names each integration
 test with `--test <name>`, so a new enforcement test is added to the recipe
@@ -462,10 +469,10 @@ red lane names the surface that broke:
 | `check-host` | `ubuntu-24.04` | The host surfaces compile. |
 | `lint-fmt`, `lint-host`, `lint-aarch64`, `lint-riscv`, `lint-x86` | `ubuntu-24.04` | Formatting, the `deny.toml` bans, and clippy at `-D warnings`; a bare-metal lint lane is also that target's compile check, since clippy builds the packages `check-target` checks. |
 | `test-units`, `test-embedded-debugger` | `ubuntu-24.04` | Unit tests and the embedded debugger. |
-| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures. |
+| `smoke-x86-64` | `ubuntu-24.04`, `--accel kvm` | Boot, shell, CPython, the in-kernel compiler, a trapped OOB load, curl over virtio-net, the raw serial captures; under `swtpm`, the kernel's signing key kept across two boots, resealed after a changed payload, and a tampered payload refused. |
 | `smoke-x86-64-venus` | `ubuntu-24.04`, `--accel kvm` | `gpu-test` on a Venus `virtio-gpu-gl` device rendered through lavapipe: a virgl context's fence, host and guest blobs, two instances at once. It runs only on changes to the 3D path, against a pinned QEMU and virglrenderer it builds and caches. |
 | `smoke-riscv64` | `ubuntu-24.04`, `--accel tcg` | Boot, shell, CPython, a trapped OOB load, the inspector RPC over vsock, curl over virtio-net. |
-| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI, against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
+| `smoke-aarch64` | `ubuntu-24.04-arm`, `--accel tcg` | Boot from the device tree and from ACPI; under `swtpm`, the kernel's signing key kept across two ACPI boots, resealed after a changed payload, changed state detected across device-tree boots, and a tampered payload refused. Runs against a pinned upstream QEMU the lane builds and caches, because Ubuntu 24.04's QEMU asserts in its emulated GICv3 under multi-threaded TCG. |
 | `bench-x86-64-linux` | `ubuntu-24.04`, `--accel kvm`, multi-queue tap | The workload benchmarks of §3.6, with the negotiated virtio-net features reported. |
 
 The bench lane is the exception: it lives in `bench-lane.yml` and runs

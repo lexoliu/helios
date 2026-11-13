@@ -26,7 +26,7 @@ use core::task::Poll;
 use core::time::Duration;
 
 use bytes::Bytes;
-use helios_hal::cpu::{Cpu, HardwarePerfCounters, current_processor};
+use helios_hal::cpu::{Cpu, HardwarePerfCounterDelta, HardwarePerfCounters, current_processor};
 use helios_hal::io::IoError;
 use helios_netstack::{
     DEFAULT_HOP_LIMIT, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DNS_PORT, DhcpAction, DhcpClient,
@@ -1482,11 +1482,28 @@ where
         events: usize,
         bytes: usize,
     ) {
-        let (Some(start), Some(end)) = (start, end) else {
+        self.record_network_profile_span(
+            phase,
+            NetworkPerfSpan::between(start, end),
+            events,
+            bytes,
+        );
+    }
+
+    fn record_network_profile_span(
+        &self,
+        phase: &'static str,
+        span: Option<NetworkPerfSpan>,
+        events: usize,
+        bytes: usize,
+    ) {
+        let Some(NetworkPerfSpan {
+            nanos: elapsed_nanos,
+            counters,
+        }) = span
+        else {
             return;
         };
-        let counters = end.counters.delta_since(start.counters);
-        let elapsed_nanos = end.nanos.saturating_sub(start.nanos);
         self.inner.profiles.record_profile_stack_parts_nanos(
             crate::ProfileScope::Kernel,
             "kernel;network;",
@@ -4196,6 +4213,109 @@ mod tests {
             block_on(poll_once(operation_parked.as_mut())).is_some(),
             "the pump hands the frame to its shard through the arrival signal"
         );
+    }
+
+    /// Two drainers of one receive ring deliver its frames to the stack
+    /// in ring order (#776).
+    ///
+    /// The pair's pump is caught mid-delivery on its own thread: the
+    /// first segments of a flow are in the socket, the next one is off
+    /// the ring and in the pump's hands, the rest are still on the ring,
+    /// and the pump holds the pair. An operation sweeping every pair —
+    /// what any socket call on another processor does when its read
+    /// finds no data — drains concurrently in that window. It must take
+    /// nothing: had it taken the segments behind the one the pump is
+    /// holding, it would land them first, and the stack would queue
+    /// each one out of order behind a hole and owe the peer a duplicate
+    /// acknowledgement for it. Once the pump finishes, the socket holds
+    /// the whole flow in sequence with nothing out of order, no
+    /// duplicate acknowledgement owed and no segment read as a resend.
+    #[test]
+    fn two_drainers_of_one_pair_deliver_a_flow_in_ring_order() {
+        use super::fixture::EstablishedTcpFixture;
+
+        const SEGMENTS: usize = 6;
+        const SEGMENT_BYTES: usize = 100;
+        const PAUSE_AFTER: usize = 2;
+
+        let fixture = EstablishedTcpFixture::new();
+        let service = fixture.service();
+        let payloads: Vec<Vec<u8>> = (0..SEGMENTS)
+            .map(|index| alloc::vec![b'a' + index as u8; SEGMENT_BYTES])
+            .collect();
+        for (index, payload) in payloads.iter().enumerate() {
+            let offset = u32::try_from(index * SEGMENT_BYTES).expect("test offset fits");
+            fixture.deliver_rx(
+                TcpHeader {
+                    source_port: EstablishedTcpFixture::PEER_PORT,
+                    destination_port: EstablishedTcpFixture::LOCAL_PORT,
+                    sequence: EstablishedTcpFixture::PEER_SEQUENCE + 1 + offset,
+                    acknowledgement: EstablishedTcpFixture::LOCAL_SEQUENCE + 1,
+                    flags: TcpFlags::ACK,
+                    window_size: u16::MAX,
+                },
+                payload,
+            );
+        }
+        let pause = service.inner.device.pause_drain(0, PAUSE_AFTER);
+        let pump_poll = NetworkPollState::new(
+            service.inner.poll.base_rx_budget,
+            service.inner.poll.base_tx_completion_budget,
+            service.inner.poll.base_tx_frame_budget,
+        );
+        assert!(
+            pump_poll.budget().rx_frames >= SEGMENTS,
+            "the pump has to be able to take the whole flow in one pass"
+        );
+
+        let (pump, operation) = std::thread::scope(|scope| {
+            let pump = scope.spawn(|| {
+                block_on(service.poll_network_once_with_tcp_read(
+                    NetworkPollSource::Pump,
+                    None,
+                    true,
+                    NetworkPollScope::Pair {
+                        pair: 0,
+                        interface_wide: true,
+                    },
+                    &pump_poll,
+                ))
+                .expect("the pump drains its pair")
+            });
+            pause.wait_until_reached();
+            let operation = block_on(service.poll_network_receive_once(NetworkPollSource::Tcp));
+            // Resumed before anything here can panic, so a failure is
+            // reported rather than left waiting on the paused pump.
+            pause.resume();
+            let pump = pump.join().expect("the pump thread finishes");
+            let (operation, _) =
+                operation.expect("the operation's sweep runs while the pump holds the pair");
+            (pump, operation)
+        });
+
+        assert_eq!(
+            operation.received_frames, 0,
+            "a second drainer took frames from a pair another processor was delivering"
+        );
+        assert_eq!(pump.progress.received_frames, SEGMENTS);
+
+        let counters = service.inner.state.tcp_counters(super::DEFAULT_SHARD_IDX);
+        assert_eq!(counters.out_of_order_queued_bytes, 0);
+        assert_eq!(counters.duplicate_acks_requested, 0);
+        assert_eq!(counters.peer_retransmits_received, 0);
+        let stream = fixture.stream();
+        let now = StackInstant::from_nanos(service.now_nanos());
+        let read = service
+            .inner
+            .state
+            .with_handle(stream, |state| {
+                state.poll_tcp_read(stream, SEGMENTS * SEGMENT_BYTES, now)
+            })
+            .expect("the stream is readable");
+        let TcpReadProgress::Data(bytes) = read else {
+            panic!("the flow did not reach the socket");
+        };
+        assert_eq!(bytes.as_ref(), payloads.concat().as_slice());
     }
 
     /// One pump per queue pair, decided from the topology: with more

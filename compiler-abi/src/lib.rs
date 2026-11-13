@@ -15,9 +15,9 @@
 //! its owner returns it through [`HELIOS_COMPILER_FREE`] with the layout it
 //! was allocated with.
 //!
-//! - The caller owns the three request buffers it allocates through
-//!   [`HELIOS_COMPILER_ALLOC`]: the wasm input, the target string and the
-//!   [`CompilerRequestHeader`]. It frees each after [`HELIOS_COMPILER_COMPILE`]
+//! - The caller owns the four request buffers it allocates through
+//!   [`HELIOS_COMPILER_ALLOC`]: the wasm input, the target string, the ISA
+//!   level name and the [`CompilerRequestHeader`]. It frees each after [`HELIOS_COMPILER_COMPILE`]
 //!   returns, on every path that leaves the plugin instance alive.
 //! - The plugin allocates the three response buffers: the
 //!   [`CompilerResponseHeader`], the precompiled output and the diagnostic.
@@ -34,7 +34,7 @@
 //! | Buffer | `len` | `align` |
 //! | --- | --- | --- |
 //! | request header | [`CompilerRequestHeader::SIZE`] | [`CompilerRequestHeader::ALIGN`] |
-//! | wasm input, target string | their byte length | 1 |
+//! | wasm input, target string, ISA level name | their byte length | 1 |
 //! | response header | [`CompilerResponseHeader::SIZE`] | [`CompilerResponseHeader::ALIGN`] |
 //! | precompiled output, diagnostic | the `len` field of the response header | 1 |
 //!
@@ -57,8 +57,12 @@
 use thiserror::Error;
 
 /// Version 2 carries `hint`, `status` and `output_kind` as plain `u32` and
-/// states the ownership and layout contract above.
-pub const HELIOS_COMPILER_ABI_VERSION: u32 = 2;
+/// states the ownership and layout contract above. Version 3 adds the target's
+/// ISA level name to the request header as a fourth caller-owned request
+/// buffer. Version 4 retires hint value 0: the plugin compiles with Cranelift
+/// only, so `Balanced` and `Performance` are the only hints, and 0 is an
+/// [`UnknownDiscriminant`] like any other.
+pub const HELIOS_COMPILER_ABI_VERSION: u32 = 4;
 
 pub const HELIOS_COMPILER_ALLOC: &str = "helios_compiler_alloc";
 pub const HELIOS_COMPILER_FREE: &str = "helios_compiler_free";
@@ -79,7 +83,6 @@ pub struct UnknownDiscriminant {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompileHint {
-    Fast,
     Balanced,
     Performance,
 }
@@ -87,7 +90,6 @@ pub enum CompileHint {
 impl From<CompileHint> for u32 {
     fn from(hint: CompileHint) -> Self {
         match hint {
-            CompileHint::Fast => 0,
             CompileHint::Balanced => 1,
             CompileHint::Performance => 2,
         }
@@ -99,7 +101,6 @@ impl TryFrom<u32> for CompileHint {
 
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(Self::Fast),
             1 => Ok(Self::Balanced),
             2 => Ok(Self::Performance),
             value => Err(UnknownDiscriminant {
@@ -237,6 +238,10 @@ wire_header! {
         wasm_len,
         target_ptr,
         target_len,
+        /// The name of the target's ISA level
+        /// (`helios_artifact::IsaLevel::name`) the artifact is compiled for.
+        isa_level_ptr,
+        isa_level_len,
         /// `HELIOS_COMPILER_REQUEST_*` bits.
         flags,
     }
@@ -265,13 +270,22 @@ mod tests {
 
     #[test]
     fn hint_round_trips() {
-        for hint in [
-            CompileHint::Fast,
-            CompileHint::Balanced,
-            CompileHint::Performance,
-        ] {
+        for hint in [CompileHint::Balanced, CompileHint::Performance] {
             assert_eq!(CompileHint::try_from(u32::from(hint)), Ok(hint));
         }
+    }
+
+    /// Value 0 was the `Fast` hint; it decodes to the error any unknown value
+    /// does.
+    #[test]
+    fn the_retired_fast_hint_value_is_refused() {
+        assert_eq!(
+            CompileHint::try_from(0),
+            Err(UnknownDiscriminant {
+                field: "hint",
+                value: 0
+            })
+        );
     }
 
     #[test]
@@ -319,8 +333,8 @@ mod tests {
     }
 
     #[test]
-    fn header_sizes_are_seven_words() {
-        assert_eq!(CompilerRequestHeader::SIZE, 28);
+    fn header_sizes_are_word_multiples() {
+        assert_eq!(CompilerRequestHeader::SIZE, 36);
         assert_eq!(CompilerResponseHeader::SIZE, 28);
         assert_eq!(CompilerRequestHeader::ALIGN, 4);
         assert_eq!(CompilerResponseHeader::ALIGN, 4);
@@ -335,11 +349,18 @@ mod tests {
             wasm_len: 12,
             target_ptr: 0x2000,
             target_len: 8,
+            isa_level_ptr: 0x3000,
+            isa_level_len: 6,
             flags: HELIOS_COMPILER_REQUEST_PROFILE,
         };
         let bytes = header.to_bytes();
-        assert_eq!(&bytes[..4], &2_u32.to_le_bytes());
+        assert_eq!(&bytes[..4], &HELIOS_COMPILER_ABI_VERSION.to_le_bytes());
         assert_eq!(&bytes[4..8], &1_u32.to_le_bytes());
+        assert_eq!(&bytes[24..28], &0x3000_u32.to_le_bytes());
+        assert_eq!(
+            &bytes[32..36],
+            &HELIOS_COMPILER_REQUEST_PROFILE.to_le_bytes()
+        );
         assert_eq!(CompilerRequestHeader::from_bytes(&bytes), header);
     }
 

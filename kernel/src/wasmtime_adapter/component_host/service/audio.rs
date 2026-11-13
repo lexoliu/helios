@@ -52,15 +52,17 @@ use super::super::StoreData;
 /// to the instance. `available` and `claim` check the instance's audio
 /// device class, and an instance without it is told what a machine with
 /// no sound device tells every program: no streams, and `unavailable`.
-pub(in crate::wasmtime_adapter::component_host) fn add_audio_to_linker<CpuImpl, Net, HostFs>(
-    linker: &mut Linker<StoreData<CpuImpl, Net, HostFs>>,
+pub(in crate::wasmtime_adapter::component_host) fn add_audio_to_linker<CpuImpl, Net, StorageImpl>(
+    linker: &mut Linker<StoreData<CpuImpl, Net, StorageImpl>>,
 ) -> wasmtime::Result<()>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
-    audio_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, HostFs>>>(linker, |state| state)
+    audio_wit::add_to_linker::<_, HasSelf<StoreData<CpuImpl, Net, StorageImpl>>>(linker, |state| {
+        state
+    })
 }
 
 /// A player's hold on one playback stream, as its store records it.
@@ -158,11 +160,11 @@ const fn to_wit_feedback(item: Feedback) -> audio_wit::Feedback {
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     /// The queue into the playback task, checked against the generation
     /// the handle names.
@@ -189,11 +191,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> audio_wit::Host for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> audio_wit::Host for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn available(&mut self) -> wasmtime::Result<Vec<audio_wit::StreamInfo>> {
         // Without the audio class the list is the one a machine with no
@@ -243,11 +245,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> audio_wit::HostPlayback for StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> audio_wit::HostPlayback for StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn info(
         &mut self,
@@ -280,11 +282,11 @@ where
     }
 }
 
-impl<CpuImpl, Net, HostFs> StoreData<CpuImpl, Net, HostFs>
+impl<CpuImpl, Net, StorageImpl> StoreData<CpuImpl, Net, StorageImpl>
 where
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     fn release_playback(&mut self, stream: u32, generation: u64) {
         let held = self
@@ -449,13 +451,13 @@ impl<T: 'static> StreamConsumer<T> for SampleStreamConsumer {
     }
 }
 
-impl<CpuImpl, Net, HostFs, U> audio_wit::HostPlaybackWithStore<U>
-    for HasSelf<StoreData<CpuImpl, Net, HostFs>>
+impl<CpuImpl, Net, StorageImpl, U> audio_wit::HostPlaybackWithStore<U>
+    for HasSelf<StoreData<CpuImpl, Net, StorageImpl>>
 where
     U: 'static,
     CpuImpl: helios_hal::cpu::Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     async fn negotiate(
         accessor: &Accessor<U, Self>,

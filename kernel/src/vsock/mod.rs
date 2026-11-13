@@ -422,14 +422,15 @@ where
 
 /// Publishes a vsock device as the kernel's vsock service and starts its
 /// receive pump.
-pub fn install_vsock_device<CpuImpl, WatchdogImpl, Device>(
-    kernel: &crate::Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_vsock_device<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &crate::Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     cpu: &CpuImpl,
     device: Device,
 ) -> VsockService<CpuImpl, Device>
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: VsockDevice + 'static,
 {
     let service = VsockService::new(cpu.clone(), kernel.timer(), device);

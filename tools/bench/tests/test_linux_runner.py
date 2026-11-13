@@ -381,6 +381,69 @@ def test_a_workload_named_after_its_process_gets_a_new_name_each_iteration(tmp_p
     assert not [record for record in records if record["type"] == "failure"]
 
 
+def fake_wasmtime(tmp_path: Path, settings_output: str) -> Path:
+    """A stand-in `wasmtime` whose `settings --json` prints `settings_output`."""
+    script = tmp_path / "wasmtime"
+    script.write_text(f"#!/bin/sh\ncat <<'EOF'\n{settings_output}\nEOF\n", encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def test_the_linux_wasmtime_run_record_names_the_isa_flags_wasmtime_inferred(tmp_path: Path) -> None:
+    settings = json.dumps(
+        {"triple": "x86_64-unknown-linux-gnu", "inferred": ["has_sse3", "has_avx", "has_avx2"]}
+    )
+    runner = workload_runner()
+    assert runner.inferred_isa_flags(str(fake_wasmtime(tmp_path, settings))) == [
+        "has_avx",
+        "has_avx2",
+        "has_sse3",
+    ]
+
+
+def test_a_wasmtime_that_infers_nothing_is_refused(tmp_path: Path) -> None:
+    runner = workload_runner()
+    with pytest.raises(SystemExit, match="no `inferred` flag list"):
+        runner.inferred_isa_flags(str(fake_wasmtime(tmp_path, json.dumps({"triple": "x86_64"}))))
+
+
+def test_the_run_record_of_the_wasmtime_side_carries_the_flags_and_the_native_side_does_not(
+    tmp_path: Path,
+) -> None:
+    settings = json.dumps({"inferred": ["has_sse3"]})
+    wasmtime = fake_wasmtime(tmp_path, settings)
+    manifest = {
+        "schema_version": 2,
+        "control_workload": "prints-ok",
+        "workloads": [
+            {
+                "name": "prints-ok",
+                "class": "compute",
+                "headline": False,
+                "runner": "shell",
+                "description": "prints ok",
+                "command": "echo ok",
+                "stdout_contains": ["ok"],
+                "stderr_empty": True,
+                "counterparts": {"linux_native": {"inherit": True}, "linux_wasmtime": {"inherit": True}},
+            }
+        ],
+    }
+    path = tmp_path / "workloads.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    runner = workload_runner()
+    context = runner.RenderContext(
+        repo_root=tmp_path, wasmtime_bin=str(wasmtime), hosts=runner.HostEndpoints(), workdir=tmp_path
+    )
+    records = {}
+    for side in ("linux_native", "linux_wasmtime"):
+        out = tmp_path / f"{side}.jsonl"
+        runner.run_workloads(path, ["prints-ok"], side, 1, context, out, True, None)
+        records[side] = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert records["linux_wasmtime"]["inferred_isa_flags"] == ["has_sse3"]
+    assert "inferred_isa_flags" not in records["linux_native"]
+
+
 def test_the_aot_curl_host_renders_the_helios_columns_compile(context) -> None:
     runner = workload_runner()
     workload = runner.selected_workload(load_workloads(), "aot-curl")
@@ -389,7 +452,7 @@ def test_the_aot_curl_host_renders_the_helios_columns_compile(context) -> None:
         wasmtime_bin=context.wasmtime_bin,
         hosts=context.hosts,
         workdir=context.workdir,
-        compiler=runner.CompilerRequest("x86_64-unknown-none", 3),
+        compiler=runner.CompilerRequest("x86_64-unknown-none", 3, "x86-64-v4+vbmi+bitalg"),
     )
     assert runner.is_resident(workload, "linux_wasmtime")
     assert not runner.is_resident(workload, "linux_native")
@@ -404,6 +467,8 @@ def test_the_aot_curl_host_renders_the_helios_columns_compile(context) -> None:
         "/tmp/work/aot-curl-output.cwasm",
         "--target",
         "x86_64-unknown-none",
+        "--isa-level",
+        "x86-64-v4+vbmi+bitalg",
         "--hint",
         "performance",
         "--workers",
@@ -419,15 +484,25 @@ def test_a_compile_request_the_run_was_not_given_is_refused(context) -> None:
     with pytest.raises(SystemExit) as error:
         runner.counterpart_command(workload, "linux_wasmtime", context)
     assert "--compiler-target" in str(error.value)
-    workers_only = runner.RenderContext(
+    no_level = runner.RenderContext(
         repo_root=context.repo_root,
         wasmtime_bin=context.wasmtime_bin,
         hosts=context.hosts,
         workdir=context.workdir,
-        compiler=runner.CompilerRequest("x86_64-unknown-none", None),
+        compiler=runner.CompilerRequest("x86_64-unknown-none", 3, None),
     )
     with pytest.raises(SystemExit) as error:
-        runner.counterpart_command(workload, "linux_wasmtime", workers_only)
+        runner.counterpart_command(workload, "linux_wasmtime", no_level)
+    assert "--compiler-isa-level" in str(error.value)
+    no_workers = runner.RenderContext(
+        repo_root=context.repo_root,
+        wasmtime_bin=context.wasmtime_bin,
+        hosts=context.hosts,
+        workdir=context.workdir,
+        compiler=runner.CompilerRequest("x86_64-unknown-none", None, "x86-64-v3"),
+    )
+    with pytest.raises(SystemExit) as error:
+        runner.counterpart_command(workload, "linux_wasmtime", no_workers)
     assert "--compiler-workers" in str(error.value)
 
 
@@ -463,10 +538,14 @@ def test_the_guest_runner_parses_the_compile_request_the_host_driver_passes() ->
         "/home/bench/helios/tools/wasmtime",
         True,
         5400,
-        runner.CompilerRequest("aarch64-unknown-none", 3),
+        runner.CompilerRequest("aarch64-unknown-none", 3, "aarch64-lse-fp16-dotprod"),
     )
     args = runner.build_parser().parse_args(shlex.split(command)[2:])
-    assert (args.compiler_target, args.compiler_workers) == ("aarch64-unknown-none", 3)
+    assert (args.compiler_target, args.compiler_workers, args.compiler_isa_level) == (
+        "aarch64-unknown-none",
+        3,
+        "aarch64-lse-fp16-dotprod",
+    )
 
 
 def resident_manifest(tmp_path: Path, die_after: int | None) -> Path:
@@ -510,6 +589,10 @@ def run_resident(tmp_path: Path, die_after: int | None) -> tuple[subprocess.Comp
             str(resident_manifest(tmp_path, die_after)),
             "--repo-root",
             str(tmp_path),
+            # The linux_wasmtime side's run record names the flags this
+            # CLI infers, whichever workloads the side times.
+            "--wasmtime-bin",
+            str(fake_wasmtime(tmp_path, json.dumps({"inferred": ["has_sse3"]}))),
             "run",
             "--side",
             "linux_wasmtime",

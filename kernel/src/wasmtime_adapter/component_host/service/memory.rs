@@ -137,14 +137,14 @@ impl Preview1AsyncMemory {
 
     /// The linear memory `instance` exports, or the shared memory its
     /// store imported when it exports none.
-    pub(super) fn of_instance<CpuImpl, Net, HostFs>(
-        store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+    pub(super) fn of_instance<CpuImpl, Net, StorageImpl>(
+        store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
         instance: &wasmtime::Instance,
     ) -> Result<Self, ProgramExecError>
     where
         CpuImpl: Cpu + Clone,
         Net: ComponentHostNetwork,
-        HostFs: crate::HostFileSystem,
+        StorageImpl: crate::Storage,
     {
         p1_memory_from_instance(store, instance)
             .map(Self::new)
@@ -425,13 +425,13 @@ pub(super) fn cjk_bytes(len: usize) -> Vec<u8> {
 }
 
 /// The caller's linear memory, as an async host function reaches it.
-pub(super) fn p1_async_memory<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_async_memory<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Option<Preview1AsyncMemory>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     p1_memory(caller).map(Preview1AsyncMemory::new)
 }
@@ -538,8 +538,8 @@ pub(super) fn nul_terminated_list_size<'a>(
     })
 }
 
-pub(super) fn p1_write_string_array<'a, CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_write_string_array<'a, CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     pointers: GuestAddress,
     buffer: GuestAddress,
     values: impl Iterator<Item = &'a str>,
@@ -547,7 +547,7 @@ pub(super) fn p1_write_string_array<'a, CpuImpl, Net, HostFs>(
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     let Some(memory) = p1_memory(caller) else {
         return p1::errno::FAULT;
@@ -570,13 +570,13 @@ where
     status
 }
 
-pub(super) fn p1_memory<CpuImpl, Net, HostFs>(
-    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_memory<CpuImpl, Net, StorageImpl>(
+    caller: &mut Caller<'_, Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
 ) -> Option<Preview1Memory>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(memory) = caller
         .get_export("memory")
@@ -596,14 +596,14 @@ where
     })
 }
 
-pub(super) fn p1_memory_from_instance<CpuImpl, Net, HostFs>(
-    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, HostFs>>,
+pub(super) fn p1_memory_from_instance<CpuImpl, Net, StorageImpl>(
+    store: &mut wasmtime::Store<Preview1ProgramStore<CpuImpl, Net, StorageImpl>>,
     instance: &wasmtime::Instance,
 ) -> Option<Preview1Memory>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
-    HostFs: crate::HostFileSystem,
+    StorageImpl: crate::Storage,
 {
     if let Some(memory) = instance.get_memory(&mut *store, "memory") {
         let data = memory.data(&mut *store);

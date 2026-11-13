@@ -672,12 +672,41 @@ impl<T: VirtioTransport> NetQueuePair<T> {
         self.interrupts.notify_all();
     }
 
+    /// Wakes this pair's waiters when its receive ring still holds
+    /// completions once the drain that held it has let go.
+    ///
+    /// Called by a receive drain right after it releases the ring. A
+    /// drain that was turned away from the held ring parked on this
+    /// pair's channel, and an interrupt that arrived during the hold
+    /// found the ring held and raised nothing, so the completions the
+    /// holder leaves behind have no other announcement: with
+    /// `VIRTIO_RING_F_EVENT_IDX` the device raises no further interrupt
+    /// for entries already past the used event. Only the waiters are
+    /// released; the pair's interrupt count is the device's own and is
+    /// not touched.
+    ///
+    /// The ring is examined after the release, not before it, so a
+    /// completion the device publishes while the holder is letting go
+    /// is still seen. A pair some other drainer has entered in between
+    /// is left alone: that drainer makes the same check when it lets
+    /// go.
+    fn wake_for_rx_backlog(&self) {
+        let backlog = self
+            .rx_state
+            .try_lock()
+            .is_some_and(|state| state.rx_queue.has_pending_used());
+        if backlog {
+            self.interrupts.notify_all();
+        }
+    }
+
     /// Whether either ring of this pair has a completion nobody has
     /// taken yet.
     ///
     /// A pair another processor currently holds is reported as idle:
-    /// that processor is draining it, so it needs no wake, and an
-    /// interrupt handler must not wait for a lock in any case.
+    /// that processor is draining it and wakes the pair's waiters when
+    /// it lets go with completions left ([`Self::wake_for_rx_backlog`]),
+    /// and an interrupt handler must not wait for a lock in any case.
     fn has_pending_completions(&self) -> bool {
         let receive = self
             .rx_state
@@ -1999,34 +2028,32 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
         self.mergeable_rx_buffers
     }
 
-    pub async fn try_receive_into(&self, output: &mut [u8]) -> IoResult<Option<usize>> {
-        const PAIR: usize = 0;
-        let mut state = self.queue_pairs[PAIR].rx_state.lock().await;
-        self.drain_returned_rx_buffers(PAIR, &mut state)?;
-        let Some(frame) = self.receive_next_frame(PAIR, &mut state)? else {
-            return Ok(None);
-        };
-        let frame_len = frame.bytes.len();
-        if frame_len > output.len() {
-            // Dropping the frame returns its slot; the next drain of
-            // this pair reposts it.
-            return Err(IoError::OutOfBounds);
-        }
-        output[..frame_len].copy_from_slice(frame.bytes.as_ref());
-        drop(frame);
-        self.drain_returned_rx_buffers(PAIR, &mut state)?;
-        Ok(Some(frame_len))
-    }
-
-    pub async fn try_receive_frame(&self) -> IoResult<Option<RxFrame>> {
-        const PAIR: usize = 0;
-        let mut state = self.queue_pairs[PAIR].rx_state.lock().await;
-        self.drain_returned_rx_buffers(PAIR, &mut state)?;
-        self.receive_next_frame(PAIR, &mut state)
-    }
-
-    /// Drains one RX queue pair without waiting for its lock, and
-    /// reports `None` when another processor holds it.
+    /// Drains up to `budget` frames from one RX queue pair without
+    /// waiting for its lock, lending each to `sink` while the pair is
+    /// held, and reports `None` when another processor holds it.
+    ///
+    /// Delivery happens under the pair's receive state, not after it is
+    /// released. A drain that popped a batch and let go before handing
+    /// it on would race every other drainer of the same pair: a second
+    /// processor could pop the frames behind the batch and deliver them
+    /// first, and the stack would read each overtaken segment as a hole
+    /// and owe a duplicate acknowledgement for it. Holding the pair
+    /// across `sink` makes ring order the delivery order. Lock order is
+    /// therefore this pair's receive state, then whatever `sink` takes;
+    /// nothing takes the receive state while holding one of those,
+    /// because nothing waits for the receive state at all — every
+    /// entry is a `try_lock`.
+    ///
+    /// The buffer under each frame is on loan for this pass alone: the
+    /// frame is dropped as soon as `sink` returns, and the slots the
+    /// pass freed are posted back to the device, and the device kicked,
+    /// before the pair is released.
+    ///
+    /// Releasing the pair with completions still on the ring — the
+    /// budget ran out, or the device completed more while `sink` ran —
+    /// wakes the pair's waiters, because whoever tried the pair in the
+    /// meantime was turned away and parked, and an interrupt raised
+    /// during the hold found the pair held and woke nobody.
     ///
     /// One pair per call: the caller owns the sweep across pairs,
     /// because only it knows which pair its processor should look at
@@ -2034,35 +2061,67 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
     /// a caller indexing by processor still lands on a real pair when
     /// the device has fewer pairs than the machine has processors.
     ///
-    /// A chain this driver refuses ends the drain, but it does not
-    /// discard it: the frames already taken off the ring travel back in
-    /// the [`RxDrain`] beside the error, because they are the caller's
-    /// from the moment they leave the used ring and nothing can put
-    /// them back.
-    pub fn try_receive_frames_immediate_on_pair(
+    /// A chain this driver refuses ends the drain. The frames in front
+    /// of it have already been through `sink`, so the [`RxDrain`]
+    /// counts them beside the error.
+    pub fn try_receive_frames_immediate_on_pair<Sink>(
         &self,
         pair_idx: usize,
-        frames: &mut [Option<RxFrame>],
-    ) -> Option<RxDrain> {
+        budget: usize,
+        mut sink: Sink,
+    ) -> Option<RxDrain>
+    where
+        Sink: FnMut(&RxFrame),
+    {
         let pair_idx = self.normalize_pair_idx(pair_idx);
-        let mut state = self.queue_pairs[pair_idx].rx_state.try_lock()?;
-        if let Err(error) = self.drain_returned_rx_buffers(pair_idx, &mut state) {
-            return Some(RxDrain::refused(0, error));
+        let pair = &self.queue_pairs[pair_idx];
+        let drain = {
+            let mut state = pair.rx_state.try_lock()?;
+            self.drain_rx_ring(pair_idx, &mut state, budget, &mut sink)
+        };
+        pair.wake_for_rx_backlog();
+        Some(drain)
+    }
+
+    /// One held pass over a receive ring: returned slots back to the
+    /// device, up to `budget` frames through `sink`, and the slots those
+    /// frames freed back to the device again.
+    fn drain_rx_ring<Sink>(
+        &self,
+        pair_idx: usize,
+        state: &mut NetRxState<T>,
+        budget: usize,
+        sink: &mut Sink,
+    ) -> RxDrain
+    where
+        Sink: FnMut(&RxFrame),
+    {
+        if let Err(error) = self.drain_returned_rx_buffers(pair_idx, state) {
+            return RxDrain::refused(0, error);
         }
         let mut received = 0usize;
-        while received < frames.len() {
-            match self.receive_next_frame(pair_idx, &mut state) {
+        let mut refusal = None;
+        while received < budget {
+            match self.receive_next_frame(pair_idx, state) {
                 Ok(Some(frame)) => {
-                    let slot = &mut frames[received];
-                    assert!(slot.is_none(), "virtio net RX batch slot was not empty");
-                    *slot = Some(frame);
+                    sink(&frame);
+                    // The loan ends here: dropping the frame puts its
+                    // slot on the pair's returned list, which the
+                    // repost below hands back to the device.
+                    drop(frame);
                     received += 1;
                 }
                 Ok(None) => break,
-                Err(error) => return Some(RxDrain::refused(received, error)),
+                Err(error) => {
+                    refusal = Some(error);
+                    break;
+                }
             }
         }
-        Some(RxDrain::completed(received))
+        if let Err(error) = self.drain_returned_rx_buffers(pair_idx, state) {
+            refusal.get_or_insert(error);
+        }
+        RxDrain { received, refusal }
     }
 
     /// Takes the next completed frame off a receive ring, assembling a
@@ -2303,36 +2362,6 @@ impl<T: VirtioTransport> VirtioNetDevice<T> {
             large_receive_segment_bytes,
             flow_hash: header.flow_hash(),
         })
-    }
-
-    pub async fn repost_rx_frame(&self, frame: RxFrame) -> IoResult<()> {
-        drop(frame);
-        for pair_idx in 0..self.queue_pairs.len() {
-            let mut state = self.queue_pairs[pair_idx].rx_state.lock().await;
-            self.drain_returned_rx_buffers(pair_idx, &mut state)?;
-        }
-        Ok(())
-    }
-
-    pub fn repost_rx_frames_immediate(
-        &self,
-        frames: &mut [Option<RxFrame>],
-    ) -> IoResult<Option<()>> {
-        for frame in frames.iter_mut() {
-            drop(frame.take());
-        }
-        let mut any_locked = false;
-        for pair_idx in 0..self.queue_pairs.len() {
-            let Some(mut state) = self.queue_pairs[pair_idx].rx_state.try_lock() else {
-                continue;
-            };
-            any_locked = true;
-            self.drain_returned_rx_buffers(pair_idx, &mut state)?;
-        }
-        if !any_locked {
-            return Ok(None);
-        }
-        Ok(Some(()))
     }
 
     /// Maps a caller-provided queue pair index onto the live
@@ -3048,11 +3077,18 @@ mod tests {
             self.reassembly_pool().free.slots.lock().len()
         }
 
+        /// Drains one frame and keeps it, the way a stack that held on
+        /// to its bytes would: the clone shares the frame's owner, so
+        /// the receive slot or reassembly buffer under it stays out of
+        /// the device's hands until the test drops what this returns.
         fn receive(&self) -> Result<Option<RxFrame>, helios_hal::io::IoError> {
-            let mut frames = [const { None }; 1];
+            let mut kept = None;
             let drain = self
                 .device
-                .try_receive_frames_immediate_on_pair(0, &mut frames)
+                .try_receive_frames_immediate_on_pair(0, 1, |frame| {
+                    assert!(kept.is_none(), "a one-frame drain lent a second frame");
+                    kept = Some(frame.clone());
+                })
                 .expect("the receive ring is uncontended in tests");
             assert!(drain.received <= 1);
             if let Some(error) = drain.refusal {
@@ -3063,7 +3099,7 @@ mod tests {
                 );
                 return Err(error);
             }
-            Ok(frames[0].take())
+            Ok(kept)
         }
     }
 
@@ -3296,6 +3332,99 @@ mod tests {
             0,
             "every receive slot must be back in the device's hands"
         );
+    }
+
+    /// Completes one single-buffer frame per payload on consecutive
+    /// descriptors from zero, the order a device fills a ring in.
+    fn complete_frames(harness: &NetHarness, payloads: &[&[u8]]) {
+        for (token, payload) in payloads.iter().enumerate() {
+            harness.complete_chain(
+                u16::try_from(token).expect("test token fits"),
+                RxDeviceHeader::default(),
+                &[payload],
+            );
+        }
+    }
+
+    /// A frame reaches the sink while the drain still holds its pair,
+    /// so a second drainer of the same pair is turned away for as long
+    /// as the first is delivering, and nothing it could take can
+    /// overtake the frames in front of it. The frames arrive in ring
+    /// order, and every slot they borrowed is back with the device by
+    /// the time the drain lets go.
+    #[test]
+    fn a_second_drainer_is_turned_away_while_the_first_delivers() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let payloads: [&[u8]; 3] = [&[0xa0; 64], &[0xa1; 64], &[0xa2; 64]];
+        complete_frames(&harness, &payloads);
+
+        let mut delivered = Vec::new();
+        let drain = harness
+            .device
+            .try_receive_frames_immediate_on_pair(0, 8, |frame| {
+                let second = harness
+                    .device
+                    .try_receive_frames_immediate_on_pair(0, 8, |_| {
+                        panic!("a second drainer took a frame from a held pair")
+                    });
+                assert!(
+                    second.is_none(),
+                    "a second drainer entered the pair while the first was delivering"
+                );
+                delivered.push(frame.bytes.as_ref()[0]);
+            })
+            .expect("the receive ring is uncontended before the drain");
+
+        assert_eq!(drain.received, payloads.len());
+        assert!(drain.refusal.is_none());
+        assert_eq!(delivered, [0xa0, 0xa1, 0xa2], "frames left in ring order");
+        let state = harness.device.queue_pairs[0]
+            .rx_state
+            .try_lock()
+            .expect("the drain released the pair");
+        assert_eq!(
+            state.rx_queue.available_descriptors(),
+            0,
+            "every slot the drain lent is back in the device's hands"
+        );
+    }
+
+    /// A drain that lets go of its pair with completions still on the
+    /// ring wakes the pair's waiters, because a drainer it turned away
+    /// is parked on that channel and the device raises nothing further
+    /// for entries it has already published. A drain that empties the
+    /// ring wakes nobody, and neither counts as a device interrupt.
+    #[test]
+    fn a_drain_that_leaves_completions_behind_wakes_the_pair() {
+        let harness = NetHarness::new(RECEIVE_OFFLOAD_FEATURES);
+        let payloads: [&[u8]; 3] = [&[0xb0; 64], &[0xb1; 64], &[0xb2; 64]];
+        complete_frames(&harness, &payloads);
+        let pair = &harness.device.queue_pairs[0];
+        let generation = pair.interrupts.generation();
+        let interrupts = harness.device.queue_interrupts(0);
+
+        let drain = harness
+            .device
+            .try_receive_frames_immediate_on_pair(0, 2, |_| {})
+            .expect("the receive ring is uncontended");
+        assert_eq!(drain.received, 2);
+        assert_eq!(
+            pair.interrupts.generation(),
+            generation + 1,
+            "a drain that stopped at its budget announces what it left"
+        );
+
+        let drain = harness
+            .device
+            .try_receive_frames_immediate_on_pair(0, 8, |_| {})
+            .expect("the receive ring is uncontended");
+        assert_eq!(drain.received, 1);
+        assert_eq!(
+            pair.interrupts.generation(),
+            generation + 1,
+            "a drain that emptied the ring has nothing to announce"
+        );
+        assert_eq!(harness.device.queue_interrupts(0), interrupts);
     }
 
     /// Exhausting the reassembly pool stalls receive until delivered

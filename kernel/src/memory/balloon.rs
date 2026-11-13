@@ -247,14 +247,15 @@ impl BalloonHandle {
 /// `generation` is the machine generation the device's resets are
 /// recorded on, which the service consults before every inflate, deflate
 /// or `actual` it puts to the device.
-pub fn install_memory_balloon<CpuImpl, WatchdogImpl, Device>(
-    kernel: &Kernel<CpuImpl, WatchdogImpl>,
+pub fn install_memory_balloon<CpuImpl, WatchdogImpl, MeasuredBootImpl, Device>(
+    kernel: &Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>,
     device: Device,
     generation: MachineGenerationHandle,
 ) -> BalloonHandle
 where
     CpuImpl: Cpu + Clone + Send + Sync + 'static,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
     Device: MemoryBalloon + Clone,
 {
     let pool = installed_user_memory_pool()

@@ -20,16 +20,20 @@ mod debug_state {
     /// The network service this machine's virtio-net device backs.
     pub(crate) type NetworkService =
         helios_kernel::NetworkService<crate::RiscvCpu, crate::net::VirtioNetworkDevice>;
-    pub(crate) type RuntimeState = helios_kernel::HostRuntimeState<
-        crate::RiscvCpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
-    pub(crate) type ProgramService = helios_kernel::UserProgramService<
-        crate::RiscvCpu,
-        NetworkService,
-        crate::host_fs::HostFileSystemService,
-    >;
+    pub(crate) type RuntimeState =
+        helios_kernel::HostRuntimeState<crate::RiscvCpu, NetworkService, Storage>;
+    pub(crate) type ProgramService =
+        helios_kernel::UserProgramService<crate::RiscvCpu, NetworkService, Storage>;
+
+    /// This machine's storage: the virtio-9p host share and the
+    /// virtio-blk disks.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Storage;
+
+    impl helios_kernel::Storage for Storage {
+        type HostShare = crate::host_fs::HostFileSystemService;
+        type Disk = crate::block::RiscvVirtioBlockDevice;
+    }
 }
 
 use ns16550a::{Break, DLAB, ParityBit, ParitySelect, StickParity, StopBits, Uart, WordLength};
@@ -1031,6 +1035,8 @@ fn shared_debug_state(
                 hart_count,
                 riscv::register::time::read64(),
                 payload,
+                // The RISC-V `Cpu` answers no feature probe (`native_feature_probe`).
+                helios_kernel::GuestIsa::for_build_target(None),
             )
         })
         .clone()

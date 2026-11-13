@@ -28,25 +28,27 @@
 use acpi::address::AddressSpace;
 use acpi::aml::namespace::{AmlName, NamespaceLevel};
 use acpi::aml::object::Object;
+use acpi::aml::op_region::{OpRegion, RegionHandler};
 use acpi::aml::resource::{self, MemoryRangeDescriptor, Resource};
-use acpi::aml::{AmlError, Interpreter};
+use acpi::aml::{AmlError, BaseInterpreter};
 use acpi::registers::FixedRegisters;
 use acpi::sdt::fadt::Fadt;
 use acpi::sdt::madt::{Madt, MadtEntry};
 use acpi::sdt::spcr::Spcr;
 use acpi::sdt::{SdtHeader, Signature};
-use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping};
+use acpi::{AcpiTables, Handle, Handler, PciAddress, PhysicalMapping, RawPhysicalMapping};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use arm_gic::Trigger;
 use core::str::FromStr;
 use helios_hal::cpu::Timebase;
+use helios_tpm::{AcpiTpm2, AcpiTpm2Locality, InterfaceDescription};
 use thiserror::Error;
 
 use super::{
     ConsoleDescription, GicDescription, MmioRegion, PlatformDescription, PlatformSource,
-    RedistributorAffinity, Slots, SpiInterrupt, VirtioMmioSlot,
+    RedistributorAffinity, Slots, SpiInterrupt, TpmDescription, VirtioMmioSlot,
 };
 
 /// The first 32 INTIDs are software-generated and private peripheral
@@ -56,6 +58,12 @@ const FIRST_SPI_INTID: u32 = 32;
 
 /// `_HID` of QEMU's virtio-mmio transport, an ARM Linaro identifier.
 const VIRTIO_MMIO_HID: &str = "LNRO0005";
+
+/// `_HID` of a TPM 2.0 device object (TCG ACPI Specification, "TPM 2.0
+/// device object"; QEMU's `TPM0`).
+const TPM_HID: &str = "MSFT0101";
+
+const TPM2_SIGNATURE: &str = "TPM2";
 
 /// The `acpi` crate's own errors, plus the ones this decode adds.
 #[derive(Debug, Error)]
@@ -82,12 +90,66 @@ pub(crate) enum AcpiError {
     Aml(AmlError),
     #[error("the {0} device's _CRS declares no {1}")]
     ResourceMissing(String, &'static str),
+    #[error("the {0} device's _CRS declares {1} interrupts; exactly one is required")]
+    InterruptCount(String, usize),
     #[error(
         "global system interrupt {0} is below the first shared peripheral interrupt; only SPIs \
          can be routed to a processor"
     )]
     NotAnSpi(u32),
+    #[error("the ACPI TPM2 table is malformed: {0}")]
+    Tpm2(helios_tpm::AcpiTpm2Error),
+    #[error(
+        "the ACPI TPM2 table names the FIFO interface, and the DSDT has no MSFT0101 device whose \
+         _CRS says where it is"
+    )]
+    Tpm2WithoutDevice,
 }
+
+/// The region handler type of this backend's AML interpreter.
+///
+/// The backend installs no operation-region handlers, so the
+/// interpreter's region handler type has no values. Naming it keeps the
+/// interpreter free of the `dyn RegionHandler` the `acpi` crate's own
+/// `Interpreter` alias would impose.
+enum NoRegionHandler {}
+
+impl RegionHandler for NoRegionHandler {
+    fn read_u8(&self, _region: &OpRegion) -> Result<u8, AmlError> {
+        match *self {}
+    }
+
+    fn read_u16(&self, _region: &OpRegion) -> Result<u16, AmlError> {
+        match *self {}
+    }
+
+    fn read_u32(&self, _region: &OpRegion) -> Result<u32, AmlError> {
+        match *self {}
+    }
+
+    fn read_u64(&self, _region: &OpRegion) -> Result<u64, AmlError> {
+        match *self {}
+    }
+
+    fn write_u8(&self, _region: &OpRegion, _value: u8) -> Result<(), AmlError> {
+        match *self {}
+    }
+
+    fn write_u16(&self, _region: &OpRegion, _value: u16) -> Result<(), AmlError> {
+        match *self {}
+    }
+
+    fn write_u32(&self, _region: &OpRegion, _value: u32) -> Result<(), AmlError> {
+        match *self {}
+    }
+
+    fn write_u64(&self, _region: &OpRegion, _value: u64) -> Result<(), AmlError> {
+        match *self {}
+    }
+}
+
+/// The AML interpreter this backend builds.
+type Interpreter = BaseInterpreter<Aarch64AcpiHandler, NoRegionHandler>;
 
 /// The ACPI tables Limine's RSDP led to.
 pub(crate) struct AcpiPlatformTables {
@@ -164,6 +226,7 @@ pub(super) fn describe(
     let gic = gic(tables)?;
     let interpreter = load_namespace(tables)?;
     let mut virtio = Slots::new();
+    let mut tpm_device = None;
     for (name, hid) in devices(&interpreter)? {
         if hid == VIRTIO_MMIO_HID {
             let (region, interrupt) = memory_and_interrupt_resource(&interpreter, &name)?;
@@ -171,8 +234,11 @@ pub(super) fn describe(
                 VirtioMmioSlot { region, interrupt },
                 "virtio-mmio transports",
             );
+        } else if hid == TPM_HID {
+            tpm_device = Some(name);
         }
     }
+    let tpm = tpm(tables, &interpreter, tpm_device.as_ref())?;
     Ok(PlatformDescription {
         source: PlatformSource::Acpi,
         console,
@@ -190,12 +256,59 @@ pub(super) fn describe(
         // than guessing: an ACPI-described machine offers no grantable
         // device yet.
         grantable: Slots::new(),
+        tpm,
         // ACPI has no counterpart to the device tree's
         // `/chosen/rng-seed`, so an ACPI-described machine starts from
         // the processor's own random source alone until the entropy
         // device joins it.
         boot_entropy_seed: None,
     })
+}
+
+/// The TPM the TPM2 table describes, when there is one.
+///
+/// The table names the interface by its start method. For the CRB it
+/// names the control area, whose page is locality 0; for the FIFO
+/// interface it names no address, and the `MSFT0101` device's `_CRS`
+/// does, which is how QEMU's `virt` publishes its `tpm-tis-device`
+/// (`hw/arm/virt-acpi-build.c`, `acpi_dsdt_add_tpm`).
+fn tpm(
+    tables: &AcpiPlatformTables,
+    interpreter: &Interpreter<Aarch64AcpiHandler>,
+    device: Option<&AmlName>,
+) -> Result<Option<TpmDescription>, AcpiError> {
+    let Some((physical_address, header)) = tables
+        .tables
+        .table_headers()
+        .find(|(_, header)| header.signature.as_str() == TPM2_SIGNATURE)
+    else {
+        return Ok(None);
+    };
+    // `SdtHeader` is packed, so the field is copied out first.
+    let length = header.length as usize;
+    // SAFETY: the address and length come from the RSDT entry the
+    // firmware published, and firmware tables sit in the direct map.
+    let bytes = unsafe {
+        let mapping = tables
+            .handler
+            .map_physical_region::<u8>(physical_address, length);
+        core::slice::from_raw_parts(mapping.virtual_start.as_ptr(), length)
+    };
+    let table = AcpiTpm2::parse(bytes).map_err(AcpiError::Tpm2)?;
+    let interface = InterfaceDescription::AcpiStartMethod(table.start_method());
+    Ok(Some(match table.locality().map_err(AcpiError::Tpm2)? {
+        AcpiTpm2Locality::Crb { base } => TpmDescription::Described { base, interface },
+        AcpiTpm2Locality::Fifo => {
+            let device = device.ok_or(AcpiError::Tpm2WithoutDevice)?;
+            TpmDescription::Described {
+                base: memory_resource(interpreter, device)?.base as u64,
+                interface,
+            }
+        }
+        AcpiTpm2Locality::Unsupported { start_method } => {
+            TpmDescription::Unsupported { start_method }
+        }
+    }))
 }
 
 fn gic(tables: &AcpiPlatformTables) -> Result<GicDescription, AcpiError> {
@@ -247,9 +360,7 @@ fn gic(tables: &AcpiPlatformTables) -> Result<GicDescription, AcpiError> {
 const GICD_FRAME_BYTES: usize = 0x1_0000;
 
 /// Loads the DSDT and every SSDT into a fresh AML namespace.
-fn load_namespace(
-    tables: &AcpiPlatformTables,
-) -> Result<Interpreter<Aarch64AcpiHandler>, AcpiError> {
+fn load_namespace(tables: &AcpiPlatformTables) -> Result<Interpreter, AcpiError> {
     let fadt = tables
         .tables
         .find_table::<Fadt>()
@@ -260,15 +371,8 @@ fn load_namespace(
     // the interpreter's `Store` opcode needs to exist; nothing here
     // reads or writes them.
     // The `acpi` crate's interpreter takes its register block as an
-    // `Arc`, and `FixedRegisters` is neither `Send` nor `Sync` because
-    // it owns raw firmware mappings. That is exactly right here: the
-    // interpreter, its registers and every object it builds live and
-    // die on the bootstrap processor inside `describe`.
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "the interpreter's constructor takes an Arc and the whole interpreter is \
-                  single-threaded, so the reference count is never shared across processors"
-    )]
+    // `Arc`. The interpreter, its registers and every object it builds
+    // live and die on the bootstrap processor inside `describe`.
     let registers =
         Arc::new(FixedRegisters::new(&fadt, tables.handler.clone()).map_err(AcpiError::Tables)?);
     let dsdt = tables.tables.dsdt().map_err(AcpiError::Tables)?;
@@ -281,7 +385,7 @@ fn load_namespace(
 }
 
 fn load_table(
-    interpreter: &Interpreter<Aarch64AcpiHandler>,
+    interpreter: &Interpreter,
     tables: &AcpiPlatformTables,
     table: acpi::AmlTable,
 ) -> Result<(), AcpiError> {
@@ -289,12 +393,16 @@ fn load_table(
     // SAFETY: the address and length come from a table header the
     // `acpi` crate already validated, and the mapping is the direct
     // physical map the bootloader left in place.
+    let mapping = unsafe {
+        PhysicalMapping::<_, u8>::new(
+            table.phys_address,
+            table.length as usize,
+            tables.handler.clone(),
+        )
+    };
     let stream = unsafe {
-        let mapping = tables
-            .handler
-            .map_physical_region::<u8>(table.phys_address, table.length as usize);
         core::slice::from_raw_parts(
-            mapping.virtual_start.as_ptr().add(header_bytes),
+            mapping.as_ptr().add(header_bytes),
             table.length as usize - header_bytes,
         )
     };
@@ -303,9 +411,7 @@ fn load_table(
 
 /// Every device object in the namespace that names a hardware ID,
 /// paired with that ID.
-fn devices(
-    interpreter: &Interpreter<Aarch64AcpiHandler>,
-) -> Result<Vec<(AmlName, String)>, AcpiError> {
+fn devices(interpreter: &Interpreter) -> Result<Vec<(AmlName, String)>, AcpiError> {
     let mut named = Vec::new();
     interpreter
         .namespace
@@ -337,10 +443,7 @@ fn devices(
 }
 
 /// The single fixed memory range a device's `_CRS` declares.
-fn memory_resource(
-    interpreter: &Interpreter<Aarch64AcpiHandler>,
-    device: &AmlName,
-) -> Result<MmioRegion, AcpiError> {
+fn memory_resource(interpreter: &Interpreter, device: &AmlName) -> Result<MmioRegion, AcpiError> {
     let resources = current_resources(interpreter, device)?;
     resources
         .iter()
@@ -360,7 +463,7 @@ fn memory_resource(
 
 /// The fixed memory range and the interrupt a device's `_CRS` declares.
 fn memory_and_interrupt_resource(
-    interpreter: &Interpreter<Aarch64AcpiHandler>,
+    interpreter: &Interpreter,
     device: &AmlName,
 ) -> Result<(MmioRegion, SpiInterrupt), AcpiError> {
     let region = memory_resource(interpreter, device)?;
@@ -372,10 +475,16 @@ fn memory_and_interrupt_resource(
             _ => None,
         })
         .ok_or_else(|| AcpiError::ResourceMissing(alloc::format!("{device}"), "interrupt"))?;
+    let &[gsiv] = irq.irqs.as_slice() else {
+        return Err(AcpiError::InterruptCount(
+            alloc::format!("{device}"),
+            irq.irqs.len(),
+        ));
+    };
     Ok((
         region,
         SpiInterrupt {
-            number: spi_from_gsiv(irq.irq)?,
+            number: spi_from_gsiv(gsiv)?,
             trigger: match &irq.trigger {
                 resource::InterruptTrigger::Edge => Trigger::Edge,
                 resource::InterruptTrigger::Level => Trigger::Level,
@@ -385,7 +494,7 @@ fn memory_and_interrupt_resource(
 }
 
 fn current_resources(
-    interpreter: &Interpreter<Aarch64AcpiHandler>,
+    interpreter: &Interpreter,
     device: &AmlName,
 ) -> Result<Vec<Resource>, AcpiError> {
     let crs = interpreter
@@ -435,17 +544,21 @@ impl Handler for Aarch64AcpiHandler {
         &self,
         physical_address: usize,
         size: usize,
-    ) -> PhysicalMapping<Self, T> {
-        PhysicalMapping {
-            physical_start: physical_address,
-            virtual_start: self.physical_to_virtual(physical_address),
-            region_length: size,
-            mapped_length: size,
-            handler: self.clone(),
+    ) -> RawPhysicalMapping<T> {
+        // SAFETY: the virtual address is the direct-map alias of the
+        // physical range, which no other mapping of this handler aliases
+        // mutably, and `unmap_physical_region` has nothing to undo.
+        unsafe {
+            RawPhysicalMapping::new(
+                physical_address,
+                self.physical_to_virtual(physical_address),
+                size,
+                size,
+            )
         }
     }
 
-    fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
+    unsafe fn unmap_physical_region<T>(&self, _region: RawPhysicalMapping<T>) {}
 
     fn read_u8(&self, address: usize) -> u8 {
         unsafe { (address as *const u8).read_volatile() }

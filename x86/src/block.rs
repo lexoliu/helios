@@ -25,7 +25,7 @@ use crate::exceptions::BLOCK_INTERRUPT_VECTORS;
 use crate::iommu::X86DmaPool;
 use crate::pci::PciRoot;
 
-type X86VirtioBlockDevice =
+pub(crate) type X86VirtioBlockDevice =
     VirtioBlockResource<VirtioPciTransport<X86DmaPool>, X86Cpu, helios_kernel::BlockPages>;
 
 #[derive(Clone)]
@@ -54,9 +54,9 @@ pub(crate) fn discover(pci: &PciRoot) -> Vec<PciAddress> {
 
 /// Brings up every block function and hands them to the kernel, which
 /// gives each the role its serial names.
-pub(crate) fn install<WatchdogImpl>(
+pub(crate) fn install<WatchdogImpl, MeasuredBootImpl>(
     cpu: &X86Cpu,
-    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl>,
+    kernel: &helios_kernel::Kernel<X86Cpu, WatchdogImpl, MeasuredBootImpl>,
     pci: &PciRoot,
     functions: &[(PciAddress, X86DmaPool)],
     destination_apic_id: u32,
@@ -65,6 +65,7 @@ pub(crate) fn install<WatchdogImpl>(
 ) -> Vec<BlockInterrupt>
 where
     WatchdogImpl: helios_hal::watchdog::Watchdog + Clone,
+    MeasuredBootImpl: helios_hal::measured_boot::MeasuredBoot,
 {
     let discovered: Vec<BlockInterrupt> = functions
         .iter()
@@ -99,15 +100,16 @@ where
         .collect();
     let state = debug_state.clone();
     // Swap is not wired on this backend (see the caller), so the scratch
-    // disk is proved and counted but nothing writes to it yet. Nothing
-    // mounts a disk yet either, so the mount sources' cache is held by
-    // its reclaim task alone.
+    // disk is proved and counted but nothing writes to it yet.
     helios_kernel::install_block_devices(
         kernel,
         root,
         devices,
-        move |service, _scratch, _mount_sources| {
+        move |service, _scratch, mount_sources| {
             state.install_block_service(service);
+            if let Some(cache) = mount_sources {
+                state.install_mount_sources(cache);
+            }
         },
     );
     discovered

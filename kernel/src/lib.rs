@@ -8,6 +8,7 @@ extern crate std;
 
 mod audio;
 mod bootfs;
+mod bring_up;
 mod buffer;
 mod component;
 #[cfg(feature = "wasmtime-runtime")]
@@ -21,7 +22,12 @@ mod host_fs;
 mod input;
 mod instance;
 mod io;
+#[cfg(feature = "wasmtime-runtime")]
+mod isa;
+#[cfg(feature = "wasmtime-runtime")]
+pub use isa::GuestIsa;
 mod kernel_exception;
+mod limine_tpm_event_log;
 mod log;
 mod machine;
 mod memory;
@@ -29,6 +35,7 @@ mod network;
 mod process;
 mod profiling;
 mod runtime;
+mod signing_key;
 mod surface;
 #[cfg(test)]
 mod test_support;
@@ -63,6 +70,7 @@ pub use audio::{
     PERIODS_IN_FLIGHT, PeriodRing, PeriodWriter, PlaybackFormat, install_audio_device,
 };
 pub use bootfs::{BootFs, BootfsBytes, EmbeddedBootDirectory, EmbeddedBootFile, EmbeddedBootFs};
+pub use bring_up::complete_device_future_at_bring_up;
 pub use buffer::{
     BYTES_PER_PIXEL, Buffer, BufferError, GuestMemory, MAX_VIEWS, Span, ViewError, ViewGroup,
     ViewId, ViewTable, WASM_PAGE_BYTES,
@@ -104,16 +112,17 @@ pub use exec::{
     CompactionBudget, CompactionPolicy, CompactionReport, CompactionTarget, Compactor,
     DEFAULT_PERF_METRIC_CAPACITY, DEFAULT_PROFILE_STACK_CAPACITY, DEFAULT_TRACE_HISTORY_CAPACITY,
     Executor, ExecutorRunStats, FoldedProfileSample, FreezeError, FrozenMachine, GUEST_TIME_SLICE,
-    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle, Mutex, MutexGuard,
-    Notified, Notify, NotifyWaiter, OwnedRawMutexLease, OwnedRawRwLockReadLease,
+    IdleOutcome, InstanceSpawner, JoinHandle, KernelClock, LocalJoinHandle,
+    MAX_FILTER_PREFIX_BYTES, MAX_FILTER_PREFIXES, Mutex, MutexGuard, Notified, Notify,
+    NotifyWaiter, ObservationScope, OwnInstance, OwnedRawMutexLease, OwnedRawRwLockReadLease,
     OwnedRawRwLockWriteLease, PerfMetricFilter, PerfMetricHistory, PerfMetricSample, PerfSample,
-    PressureLevel, ProfileFilter, ProfileHistory, ProfileScope, ProfileSink, ProgressChanged,
-    ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock, RawRwLockReadLease,
-    RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard, Sleep, Spawner,
-    StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField, TraceFilter,
-    TraceHistory, TraceLevel, TraceValue, UptimeClock, YieldNow, elapsed_millis,
-    matches_perf_metric_filter, matches_profile_filter, matches_trace_filter, monotonic_nanos,
-    parse_console_text, wall_clock_offset_nanos, yield_now,
+    PrefixSet, PrefixSetError, PressureLevel, ProfileFilter, ProfileHistory, ProfileScope,
+    ProfileSink, ProgressChanged, ProgressMark, ProgressSignal, RawMutex, RawMutexLease, RawRwLock,
+    RawRwLockReadLease, RawRwLockWriteLease, ReadyLink, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    Sleep, Spawner, StatsSample, TaskCapacityError, TaskFunding, Timer, TraceEvent, TraceField,
+    TraceFilter, TraceHistory, TraceLevel, TraceLog, TraceValue, UptimeClock, YieldNow,
+    elapsed_millis, matches_perf_metric_filter, matches_profile_filter, matches_trace_filter,
+    monotonic_nanos, parse_console_text, wall_clock_offset_nanos, yield_now,
 };
 pub use gpu::{
     ContextRecord, ContextShared, Gpu3dOwnership, Gpu3dSender, Gpu3dService, Gpu3dServiceError,
@@ -123,8 +132,8 @@ pub use gpu::{
 pub use helios_hal::Platform;
 pub use helios_netstack::{
     ChecksumOffload, DEFAULT_POLL_BUDGET, EventDeliveryCapabilities, InterfaceCapabilities,
-    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, PacketBuffer, RxDrain,
-    RxFrame, RxFrameOffload, SegmentationOffload, TxFrameRef,
+    InterfaceEventMark, LinkState, NetworkInterface as NetworkDevice, RxDrain, RxFrame,
+    RxFrameOffload, SegmentationOffload, TxFrameRef,
 };
 pub use host_fs::{
     FilledHostFsWrite, HOST_SHARE_GUEST_MOUNT_PATH, HOST_SHARE_MOUNT_TAG, HostFsCacheStats,
@@ -158,9 +167,11 @@ pub use kernel_exception::{
     KernelException, KernelExceptionCause, KernelExceptionDispatch, KernelNativeTrapHandler,
     dispatch_native_trap, install_native_trap_handler,
 };
+pub use limine_tpm_event_log::LimineTpmEventLogRequest;
 pub use machine::{
-    AdvanceCause, DeviceResets, Generation, MachineGeneration, MachineGenerationHandle,
-    ResetDevice, UnhandledAdvances, install_generation_reactions,
+    AdvanceCause, DeviceResets, GENERATION_PROBE_INTERVAL, Generation, MachineGeneration,
+    MachineGenerationHandle, ResetDevice, UnhandledAdvances, install_generation_reactions,
+    spawn_generation_probe,
 };
 pub use memory::{
     AGE_BATCH_PAGES, AccessibilityPlan, BalloonHandle, BalloonStats, BootMemoryPlan,
@@ -203,17 +214,17 @@ pub use network::{
 pub use process::{
     AudioClaimCap, ClockAuthorityRights, CompileAuthority, DescriptorEntry, DescriptorId,
     DescriptorLimit, DescriptorTable, DescriptorTableError, DeviceClassRights, DeviceGrantClaimCap,
-    DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen, DisplayClaimCap, DnsCap,
-    ExecAuthority, ForkAuthority, FutexKey, FutexTable, FutexWaitRegistration, GpuOpenCap,
-    GuestAddress, InputClaimCap, JoinAuthority, LinkAuthorityRights, LinkSourceCap,
-    LinkTargetDirectoryCap, MountAuthorityRights, MountCap, MulticastCap, NetworkAdminCap,
-    NetworkAuthorityRights, NetworkCap, PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError,
-    ProcessAuthorityRights, ProcessId, ProcessMemoryIdentity, ProcessRecord, ProcessState,
-    ProcessTable, ProcessTableError, ProgramExecError, ProgramExecErrorDetail,
-    ProgramExecErrorKind, ProgramOutOfMemory, RuntimeMessage, SetWallClockCap, SignalAuthority,
-    SpawnAuthority, SymlinkCreateCap, SymlinkReadCap, TcpCap, TerminalAuthorityRights,
-    TerminalInputCap, TerminalOutputCap, ThreadId, ThreadRecord, ThreadState, ThreadTable,
-    ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
+    DiagnosticAuthorityRights, DirectoryAuthorityRights, DirectoryCap, DirectoryPreopen,
+    DisplayClaimCap, DnsCap, ExecAuthority, ForkAuthority, FutexKey, FutexTable,
+    FutexWaitRegistration, GpuOpenCap, GuestAddress, InputClaimCap, JoinAuthority,
+    LinkAuthorityRights, LinkSourceCap, LinkTargetDirectoryCap, MountAuthorityRights, MountCap,
+    MulticastCap, NetworkAdminCap, NetworkAuthorityRights, NetworkCap, ObserveMachineCap,
+    PrivilegedBindCap, ProcessAuthority, ProcessAuthorityError, ProcessAuthorityRights, ProcessId,
+    ProcessMemoryIdentity, ProcessRecord, ProcessState, ProcessTable, ProcessTableError,
+    ProgramExecError, ProgramExecErrorDetail, ProgramExecErrorKind, ProgramOutOfMemory,
+    RuntimeMessage, SetWallClockCap, SignalAuthority, SpawnAuthority, SymlinkCreateCap,
+    SymlinkReadCap, TcpCap, TerminalAuthorityRights, TerminalInputCap, TerminalOutputCap, ThreadId,
+    ThreadRecord, ThreadState, ThreadTable, ThreadTableError, TtyControlCap, UdpCap, UnmountCap,
 };
 pub use profiling::{
     CodeAttribution, InstructionProfile, InstructionProfileError, InstructionSampler,
@@ -230,6 +241,10 @@ pub use runtime::{
     SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
     TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
 };
+pub use signing_key::{
+    CwasmSigningKey, PAYLOAD_REGISTER, ProvisionCause, SeedSource, SettledSigningKey,
+    SigningKeyError, settle_signing_key,
+};
 pub use surface::{
     MAX_INSTANCE_SURFACES, MAX_LIVE_SURFACES, ReturnedSurface, ReturnedSurfaces,
     SURFACE_EVENT_QUEUE_DEPTH, SURFACE_REQUEST_QUEUE_DEPTH, SurfaceCreate, SurfaceEvents,
@@ -237,10 +252,11 @@ pub use surface::{
     SurfaceServiceError, SurfaceShared,
 };
 pub use vfs::{
-    BOOT_DEVICE, FileContents, Follow, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
-    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
-    MountSource, MountTable, MountedFs, MountedWrite, Namespace, ROOT_LAYER_DEVICE, Resolved,
-    RootFs, RootWrite, object_identity, request_mount, request_unmount, symlink_target,
+    AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow, HeldPath,
+    HostShare, HostShareWrite, MAX_MOUNTS, MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError,
+    MountHold, MountRequestError, MountSource, MountTable, MountedFs, MountedWrite, Namespace,
+    NoDisks, ROOT_LAYER_DEVICE, ReaderError, Resolved, RootFs, RootWrite, Storage,
+    UnsupportedStorage, object_identity, request_mount, request_unmount, symlink_target,
     within_directory,
 };
 pub use vsock::{
@@ -271,6 +287,7 @@ use core::time::Duration;
 
 use arrayvec::ArrayVec;
 use helios_hal::cpu::{Cpu, Instant, ProcessorId, current_processor};
+use helios_hal::measured_boot::{MeasuredBoot, NoMeasuredBoot};
 use helios_hal::memory::MemoryRegion;
 use helios_hal::watchdog::{NoWatchdog, ProgressCounter, Watchdog};
 use helios_hal::{DeviceInventory, DmaModel, ProcessorStartupPolicy, ProcessorTopology};
@@ -842,17 +859,35 @@ const MAX_BOOT_MEMORY_REGIONS: usize = 128;
 /// user pool has already refused once.
 const KERNEL_HEAP_TOP_UP_BACKOFF: usize = 1024;
 
-pub struct Kernel<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone = NoWatchdog> {
+pub struct Kernel<
+    CpuImpl: Cpu + Clone,
+    WatchdogImpl: Watchdog + Clone = NoWatchdog,
+    MeasuredBootImpl: MeasuredBoot = NoMeasuredBoot,
+> {
     cpu: CpuImpl,
     executor: Executor,
     timer: Timer<CpuImpl>,
     watchdog: WatchdogImpl,
+    /// The platform's measured-boot device, on the bootstrap processor
+    /// until bring-up settles the compiler-signing key with it
+    /// ([`Self::take_measured_boot`]); empty on every other processor
+    /// and afterwards. The lock is taken once, by the one bring-up call
+    /// on the bootstrap processor, and no interrupt handler reaches it.
+    measured_boot: spin::Mutex<Option<MeasuredBootImpl>>,
     topology: ProcessorTopology,
     dma_model: DmaModel,
     devices: DeviceInventory,
 }
 
-impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone> Kernel<CpuImpl, WatchdogImpl> {
+impl<CpuImpl: Cpu + Clone, WatchdogImpl: Watchdog + Clone, MeasuredBootImpl: MeasuredBoot>
+    Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>
+{
+    /// Hands the measured-boot device to the bring-up step that settles
+    /// the compiler-signing key; every later call answers `None`.
+    pub(crate) fn take_measured_boot(&self) -> Option<MeasuredBootImpl> {
+        self.measured_boot.lock().take()
+    }
+
     pub fn spawner(&self) -> Spawner<CpuImpl> {
         self.executor.spawner(self.cpu.clone())
     }
@@ -1156,25 +1191,27 @@ impl<CpuImpl: Cpu + Clone> Wake for LocalFutureParker<CpuImpl> {
     }
 }
 
-pub fn init<Console, CpuImpl, Regions>(
-    platform: Platform<Console, CpuImpl, Regions>,
-) -> Kernel<CpuImpl>
+pub fn init<Console, CpuImpl, Regions, MeasuredBootImpl>(
+    platform: Platform<Console, CpuImpl, Regions, NoWatchdog, MeasuredBootImpl>,
+) -> Kernel<CpuImpl, NoWatchdog, MeasuredBootImpl>
 where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu + Clone,
     Regions: IntoIterator<Item = MemoryRegion>,
+    MeasuredBootImpl: MeasuredBoot,
 {
     init_with_watchdog(platform)
 }
 
-pub fn init_with_watchdog<Console, CpuImpl, Regions, WatchdogImpl>(
-    platform: Platform<Console, CpuImpl, Regions, WatchdogImpl>,
-) -> Kernel<CpuImpl, WatchdogImpl>
+pub fn init_with_watchdog<Console, CpuImpl, Regions, WatchdogImpl, MeasuredBootImpl>(
+    platform: Platform<Console, CpuImpl, Regions, WatchdogImpl, MeasuredBootImpl>,
+) -> Kernel<CpuImpl, WatchdogImpl, MeasuredBootImpl>
 where
     Console: core::fmt::Write + Send + 'static,
     CpuImpl: Cpu + Clone,
     Regions: IntoIterator<Item = MemoryRegion>,
     WatchdogImpl: Watchdog + Clone,
+    MeasuredBootImpl: MeasuredBoot,
 {
     let Platform {
         console,
@@ -1185,8 +1222,17 @@ where
         timer_frequency_hz,
         dma_model,
         devices,
+        measured_boot,
     } = platform;
     let current_processor = current_processor();
+    // The device is settled once, by the bootstrap processor's bring-up;
+    // a secondary that was handed one would hold a handle nothing uses.
+    assert!(
+        measured_boot.is_none() || current_processor == topology.bootstrap_processor,
+        "processor {} was handed a measured-boot device; only the bootstrap processor {} owns it",
+        current_processor.id(),
+        topology.bootstrap_processor.id()
+    );
     assert!(
         cpu.bootstrap_processor() == topology.bootstrap_processor,
         "platform topology bootstrap processor {} does not match CPU bootstrap processor {}",
@@ -1229,6 +1275,7 @@ where
         cpu,
         executor,
         watchdog,
+        measured_boot: spin::Mutex::new(measured_boot),
         topology,
         dma_model,
         devices,

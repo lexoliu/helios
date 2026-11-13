@@ -70,7 +70,7 @@ reason under the table the cell is missing from.
 | fs | `fs-smallfiles`, `fs-readstream` | coreutils on the embedded filesystem root | `coreutils-wasi.wasm` under `wasmtime run --dir` | ext4 in the guest |
 | compute | `quickjs-loop`, `cpython-json`, `cpython-regex`, `wasm-simd-lanes` | interpreter or SIMD loops | same wasm | native QuickJS/CPython/NEON-or-SSE probe |
 | compute | `cpython-startup`, `cpython-import-json` | the CPython row decomposed — interpreter start-up alone, then start-up plus `import json` over the host share | same wasm | native CPython |
-| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
+| compute | `aot-curl` | compiler plugin AOT of `curl.wasm` for the kernel target, performance hint, the kernel's worker count | the same compiler plugin under Wasmtime on Linux (`helios-compiler-host`), the same input, target, ISA level (the one the Helios guest reports), hint and worker count | `wasmtime compile` of the same input (a reference, uncompared) |
 
 `headline: true` marks the rows the README table and the regression gate
 carry. Every compared row is a parity check, not a claim: Helios running
@@ -280,7 +280,7 @@ nanoseconds from `rpc-arrival`:
 | --- | --- |
 | `rpc_arrival_ns` | the launch call entered the kernel; always `0`, the epoch |
 | `source_read_ns` | the program's bytes are read out of their source (`source_bytes` carries the size) |
-| `trust_ns` | artifact trust established — the bootfs trailer parse, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
+| `trust_ns` | artifact trust established — the bootfs artifact hand-off, the signature check for a signed artifact, or — on a raw-wasm source — the whole in-kernel compile+sign between `load_begin` and here |
 | `cache_lookup_ns` | the deserialize cache answered (`cache_hit` carries its answer) |
 | `deserialize_ns` | the `cwasm` payload deserialized; present only on a cache miss |
 | `instantiate_pre_ns` | the `InstancePre` cache answered or `instantiate_pre` built (`instantiate_pre_hit`) |
