@@ -53,34 +53,103 @@ enum AckPolicy {
     Batched(usize),
 }
 
+/// The bottleneck link: its rate and its queue.
+#[derive(Clone, Copy, Debug)]
+struct Bottleneck {
+    bytes_per_second: u64,
+    /// The tail-drop queue limit; `None` queues without bound.
+    buffer_bytes: Option<u64>,
+}
+
+impl Bottleneck {
+    fn serialization_nanos(self, bytes: u32) -> u64 {
+        u64::from(bytes) * NANOS_PER_SECOND / self.bytes_per_second
+    }
+
+    /// The bandwidth-delay product over a propagation delay of
+    /// `rtt_nanos`: the rate over the shortest round trip a segment can
+    /// see, which includes its own serialization.
+    fn bdp_bytes(self, rtt_nanos: u64) -> u64 {
+        let rtt = rtt_nanos + self.serialization_nanos(MSS);
+        self.bytes_per_second * rtt / NANOS_PER_SECOND
+    }
+
+    /// What the path holds before this queue overflows: the
+    /// bandwidth-delay product plus the buffer.
+    fn capacity_bytes(self, rtt_nanos: u64) -> u64 {
+        self.bdp_bytes(rtt_nanos) + self.buffer_bytes.expect("a tail-drop buffer")
+    }
+
+    /// The longest round trip a segment can see: the propagation delay,
+    /// its own serialization, and a full buffer ahead of it.
+    fn full_queue_rtt_nanos(self, rtt_nanos: u64) -> u64 {
+        let buffer = self.buffer_bytes.expect("a tail-drop buffer");
+        rtt_nanos
+            + self.serialization_nanos(MSS)
+            + buffer * NANOS_PER_SECOND / self.bytes_per_second
+    }
+}
+
+/// The bottleneck a path switches to at a set time, for the rest of
+/// the run. Segments already queued keep the departure times the old
+/// rate gave them.
+#[derive(Clone, Copy, Debug)]
+struct BottleneckChange {
+    at_nanos: u64,
+    bottleneck: Bottleneck,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Path {
-    bottleneck_bytes_per_second: u64,
+    bottleneck: Bottleneck,
+    change: Option<BottleneckChange>,
     /// Two-way propagation delay, half each way.
     rtt_nanos: u64,
     ack_policy: AckPolicy,
     budget: TcpSegmentBudget,
-    /// The bottleneck's tail-drop queue limit; `None` queues without
-    /// bound.
-    buffer_bytes: Option<u64>,
 }
 
 impl Path {
     /// 50 Mbit/s over 20 ms: a BDP of 125 kB, about 86 segments.
     const fn wan(ack_policy: AckPolicy) -> Self {
         Self {
-            bottleneck_bytes_per_second: 6_250_000,
+            bottleneck: Bottleneck {
+                bytes_per_second: 6_250_000,
+                buffer_bytes: None,
+            },
+            change: None,
             rtt_nanos: 20 * MILLISECOND,
             ack_policy,
             budget: TcpSegmentBudget::wire_segments(TCP_WIRE_SEGMENT),
-            buffer_bytes: None,
         }
     }
 
     const fn with_buffer(self, buffer_bytes: u64) -> Self {
         Self {
-            buffer_bytes: Some(buffer_bytes),
+            bottleneck: Bottleneck {
+                buffer_bytes: Some(buffer_bytes),
+                ..self.bottleneck
+            },
             ..self
+        }
+    }
+
+    /// From `at_nanos` on, the bottleneck is `bottleneck`.
+    const fn changing_to(self, at_nanos: u64, bottleneck: Bottleneck) -> Self {
+        Self {
+            change: Some(BottleneckChange {
+                at_nanos,
+                bottleneck,
+            }),
+            ..self
+        }
+    }
+
+    /// The bottleneck in place at `now`.
+    fn bottleneck_at(&self, now: u64) -> Bottleneck {
+        match self.change {
+            Some(change) if now >= change.at_nanos => change.bottleneck,
+            _ => self.bottleneck,
         }
     }
 
@@ -94,16 +163,10 @@ impl Path {
         }
     }
 
-    fn serialization_nanos(&self, bytes: u32) -> u64 {
-        u64::from(bytes) * NANOS_PER_SECOND / self.bottleneck_bytes_per_second
-    }
-
-    /// The bandwidth-delay product of the empty path: the bottleneck
-    /// rate over the shortest round trip a segment can see, which
-    /// includes its own serialization.
+    /// The bandwidth-delay product of the empty path at its first
+    /// bottleneck.
     fn bdp_bytes(&self) -> u64 {
-        let rtt = self.rtt_nanos + self.serialization_nanos(MSS);
-        self.bottleneck_bytes_per_second * rtt / NANOS_PER_SECOND
+        self.bottleneck.bdp_bytes(self.rtt_nanos)
     }
 }
 
@@ -148,8 +211,9 @@ where
     next_event_id: u64,
     receiver: Receiver,
     payload: Bytes,
-    /// Segments the bottleneck's full buffer dropped.
-    tail_drops: u64,
+    /// When the bottleneck's full buffer dropped a segment, one entry
+    /// per segment.
+    tail_drops: Vec<u64>,
 }
 
 impl<C, D> Sim<C, D>
@@ -201,7 +265,7 @@ where
                 ..Receiver::default()
             },
             payload: Bytes::from(alloc::vec![0x5a; 64 * 1024]),
-            tail_drops: 0,
+            tail_drops: Vec::new(),
         }
     }
 
@@ -260,19 +324,19 @@ where
             let len = piece.min(segment.sequence_len - offset);
             let sequence = segment.header.sequence + offset;
             offset += len;
+            let bottleneck = self.path.bottleneck_at(self.now);
             let queued_bytes = self.link_free_at.saturating_sub(self.now)
-                * self.path.bottleneck_bytes_per_second
+                * bottleneck.bytes_per_second
                 / NANOS_PER_SECOND;
-            if self
-                .path
+            if bottleneck
                 .buffer_bytes
                 .is_some_and(|buffer| queued_bytes + u64::from(len) > buffer)
             {
-                self.tail_drops += 1;
+                self.tail_drops.push(self.now);
                 continue;
             }
             let start = self.link_free_at.max(self.now);
-            self.link_free_at = start + self.path.serialization_nanos(len);
+            self.link_free_at = start + bottleneck.serialization_nanos(len);
             if !(self.drop)(&self.socket, self.now, sequence, segment.retransmission) {
                 let arrival = self.link_free_at + self.path.rtt_nanos / 2;
                 self.schedule(arrival, Event::Arrival { sequence, len });
@@ -439,6 +503,8 @@ struct BbrObservation {
     inflight_longterm: Option<u64>,
     inflight_shortterm: Option<u64>,
     in_loss_recovery: bool,
+    cwnd_limited: bool,
+    retransmission_timeout_nanos: u64,
 }
 
 fn observe_bbr(socket: &TcpSocket<BbrV3>, now: u64) -> BbrObservation {
@@ -460,6 +526,8 @@ fn observe_bbr(socket: &TcpSocket<BbrV3>, now: u64) -> BbrObservation {
         inflight_longterm: bbr.inflight_longterm(),
         inflight_shortterm: bbr.inflight_shortterm(),
         in_loss_recovery: bbr.in_loss_recovery(),
+        cwnd_limited: socket.cwnd_limited(),
+        retransmission_timeout_nanos: socket.retransmission_timeout_nanos(),
     }
 }
 
@@ -483,7 +551,7 @@ fn assert_bbr_converged<D>(path: Path, observations: &[BbrObservation], sim: &Si
 where
     D: FnMut(&TcpSocket<BbrV3>, u64, u32, bool) -> bool,
 {
-    let rate = path.bottleneck_bytes_per_second;
+    let rate = path.bottleneck.bytes_per_second;
     let last = observations.last().expect("the flow was acknowledged");
     assert!(
         matches!(
@@ -713,41 +781,233 @@ fn the_short_term_bound_a_loss_sets_is_reset_by_the_next_refill() {
     assert_bbr_converged(path, &observations, &sim);
 }
 
+/// Consecutive observations across which ProbeBW_UP, outside loss
+/// recovery, raised the long-term bound.
+fn raised_in_probe_bw_up(
+    observations: &[BbrObservation],
+) -> impl Iterator<Item = &[BbrObservation]> {
+    observations.windows(2).filter(|pair| {
+        pair.iter().all(|observation| {
+            observation.state == BbrState::ProbeBwUp && !observation.in_loss_recovery
+        }) && pair[1].inflight_longterm > pair[0].inflight_longterm
+    })
+}
+
 #[test]
-fn the_long_term_bound_rises_in_probes_after_the_bottleneck_buffer_overflows() {
-    // A tail-drop bottleneck buffer of one BDP: a probe that queues more
-    // than that loses packets, and the loss sets the long-term bound.
-    // Each later ProbeBW_UP round that fills the window without loss
-    // raises it again (draft section 5.3.3.9,
-    // `ProbeInflightLongtermUpward`).
+fn the_long_term_bound_rises_in_probes_once_the_path_has_room_above_it() {
+    // The one-BDP tail-drop buffer below: the first probe that
+    // overflows it sets the long-term bound at what the path held, about
+    // two BDPs. At 3 s the bottleneck quadruples, with a buffer of its
+    // own new BDP, so the bound sits near half the new BDP and caps the
+    // flow near half the new rate. Only ProbeBW_UP can lift it: on an
+    // ACK that finds the flow window-limited at the bound without loss,
+    // `ProbeInflightLongtermUpward` raises it and, once a round,
+    // `RaiseInflightLongtermSlope` doubles the rate it rises at (draft
+    // section 5.3.3.9).
     let wan = Path::wan(AckPolicy::EverySegment);
-    let path = wan.with_buffer(wan.bdp_bytes());
-    let (observations, sim) = run_bbr(path, seconds(9), no_drops);
-    assert_ne!(sim.tail_drops, 0, "the probes never overflowed the buffer");
-    let set = observations
+    let quadrupled = Bottleneck {
+        bytes_per_second: 4 * wan.bottleneck.bytes_per_second,
+        buffer_bytes: None,
+    };
+    let faster = Bottleneck {
+        buffer_bytes: Some(quadrupled.bdp_bytes(wan.rtt_nanos)),
+        ..quadrupled
+    };
+    let change_at = seconds(3);
+    let path = wan
+        .with_buffer(wan.bdp_bytes())
+        .changing_to(change_at, faster);
+    let (observations, sim) = run_bbr(path, change_at + seconds(9), no_drops);
+    assert!(
+        sim.tail_drops.iter().any(|&at| at < change_at),
+        "the probes never overflowed the first buffer"
+    );
+    let bound_at_change = observations
         .iter()
-        .position(|observation| observation.inflight_longterm.is_some())
-        .expect("a loss sets inflight_longterm");
-    let raised_in_up = observations[set..]
-        .windows(2)
-        .filter(|pair| {
-            pair[0].state == BbrState::ProbeBwUp
-                && pair[1].state == BbrState::ProbeBwUp
-                && !pair[0].in_loss_recovery
-                && !pair[1].in_loss_recovery
-                && pair[1].inflight_longterm > pair[0].inflight_longterm
-        })
+        .rfind(|observation| observation.now < change_at)
+        .and_then(|observation| observation.inflight_longterm)
+        .expect("a loss before the change set the bound");
+    let faster_bdp = faster.bdp_bytes(path.rtt_nanos);
+    assert!(
+        bound_at_change < faster_bdp,
+        "the bound {bound_at_change} B already covered the new {faster_bdp} B BDP"
+    );
+    let raises: Vec<_> = raised_in_probe_bw_up(&observations).collect();
+    for pair in &raises {
+        assert!(
+            pair[1].cwnd_limited,
+            "the bound rose from {:?} to {:?} at {} ns with the window not full",
+            pair[0].inflight_longterm, pair[1].inflight_longterm, pair[1].now
+        );
+    }
+    let raised_after_change = raises
+        .iter()
+        .filter(|pair| pair[1].now >= change_at)
         .count();
     assert!(
-        raised_in_up >= 2,
-        "inflight_longterm rose {raised_in_up} times in ProbeBW_UP"
+        raised_after_change >= 2,
+        "ProbeBW_UP raised the bound {raised_after_change} times after the change"
     );
-    let last = observations.last().expect("observed");
-    let rate = path.bottleneck_bytes_per_second;
-    let goodput = sim.goodput(last.now - seconds(2), last.now);
+    // The next ProbeBW cycle after the change starts at most
+    // `BBR.ProbeBWMaxWait` (3 s) after the one before it; three more
+    // seconds of slack leave the last two to the converged flow.
+    let (from, to) = (change_at + seconds(7), change_at + seconds(9));
+    let rate = faster.bytes_per_second;
+    let goodput = sim.goodput(from, to);
     assert!(
         goodput * 100 >= rate * 90,
         "goodput {goodput} B/s against a {rate} B/s bottleneck"
+    );
+}
+
+#[test]
+fn the_long_term_bound_stays_where_the_bottleneck_buffer_overflowed() {
+    // The complement on a constant path: once the one-BDP buffer has
+    // overflowed, the bound records what the path held, and every later
+    // probe ends on the bandwidth plateau before the window fills at the
+    // bound, so nothing moves it (`ProbeInflightLongtermUpward` returns
+    // while `!C.is_cwnd_limited || C.cwnd < BBR.inflight_longterm`).
+    let wan = Path::wan(AckPolicy::EverySegment);
+    let path = wan.with_buffer(wan.bdp_bytes());
+    let (observations, sim) = run_bbr(path, seconds(9), no_drops);
+    assert!(
+        !sim.tail_drops.is_empty(),
+        "the probes never overflowed the buffer"
+    );
+    let first_episode_end = observations
+        .iter()
+        .skip_while(|observation| !observation.in_loss_recovery)
+        .find(|observation| !observation.in_loss_recovery)
+        .expect("the first loss episode ended");
+    let bound = first_episode_end
+        .inflight_longterm
+        .expect("the first loss set the bound");
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.now >= first_episode_end.now)
+    {
+        assert_eq!(
+            observation.inflight_longterm,
+            Some(bound),
+            "the bound moved at {} ns",
+            observation.now
+        );
+    }
+    // The dropped segment found the buffer full, so the volume in flight
+    // before it, the least `InflightAtLoss` returns, is the path's
+    // capacity less the segment on the wire and the dropped one. The
+    // bound rises above that only to the `RS.tx_in_flight` of a segment
+    // that was delivered (`AdaptLongTermModel`), which the window it was
+    // sent under bounds.
+    let capacity = path.bottleneck.capacity_bytes(path.rtt_nanos);
+    let widest = observations
+        .iter()
+        .take_while(|observation| observation.now <= first_episode_end.now)
+        .map(|observation| observation.cwnd)
+        .max()
+        .expect("observed");
+    assert!(
+        (capacity - 2 * u64::from(MSS)..=widest).contains(&bound),
+        "the bound {bound} B against a {capacity} B path and a widest window of {widest} B"
+    );
+    let rate = path.bottleneck.bytes_per_second;
+    let goodput = sim.goodput(seconds(7), seconds(9));
+    assert!(
+        goodput * 100 >= rate * 90,
+        "goodput {goodput} B/s against a {rate} B/s bottleneck"
+    );
+}
+
+/// The loss-recovery episodes `observations` saw, as start and end
+/// times; one still open at the last observation ends there.
+fn recovery_episodes(observations: &[BbrObservation]) -> Vec<(u64, u64)> {
+    let mut episodes = Vec::new();
+    let mut open = None;
+    for observation in observations {
+        match (open, observation.in_loss_recovery) {
+            (None, true) => open = Some(observation.now),
+            (Some(start), false) => {
+                episodes.push((start, observation.now));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let (Some(start), Some(last)) = (open, observations.last()) {
+        episodes.push((start, last.now));
+    }
+    episodes
+}
+
+#[test]
+fn bbr_repairs_each_run_a_coalesced_burst_loses_to_the_bottleneck_buffer() {
+    // The tail-drop buffer of one BDP above, behind a sender that
+    // coalesces each pass into one burst under one send time: every
+    // ProbeBW_UP overflows the buffer and drops runs of consecutive
+    // segments, which a peer without SACK names one per round trip.
+    let wan = Path::wan(AckPolicy::EverySegment).coalescing();
+    let path = wan.with_buffer(wan.bdp_bytes());
+    let (observations, sim) = run_bbr(path, seconds(9), no_drops);
+    assert!(
+        !sim.tail_drops.is_empty(),
+        "the probes never overflowed the buffer"
+    );
+    let rto = observations
+        .iter()
+        .find(|observation| observation.in_loss_recovery)
+        .expect("a loss opened an episode")
+        .retransmission_timeout_nanos;
+    // Karn's rule keeps a resent segment's round trip out of the
+    // estimator, so recovery never inflates the timer it relies on.
+    for observation in &observations {
+        assert!(
+            observation.retransmission_timeout_nanos <= rto,
+            "the RTO grew to {} ns at {} ns from {rto} ns",
+            observation.retransmission_timeout_nanos,
+            observation.now
+        );
+    }
+    // Every round trip here is at most `full_rtt`. Fast recovery ends at
+    // the latest when the retransmission timer fires: one RTO after the
+    // first partial ACK, which comes a round trip after the fast
+    // retransmission, or, when the fast retransmission is itself lost,
+    // that segment's own timer, which the socket backs off once per
+    // resend (`backed_off_timeout_nanos`): `2 * rto` covers both. After a
+    // timeout, go-back-N repairs at least the front hole every round
+    // trip. So an episode lasts at most `2 * rto` plus a round trip per
+    // segment the buffer dropped since the episode before it ended.
+    let full_rtt = path.bottleneck.full_queue_rtt_nanos(path.rtt_nanos);
+    let holes_in = |from: u64, to: u64| {
+        let count = sim
+            .tail_drops
+            .iter()
+            .filter(|&&at| (from..to).contains(&at))
+            .count();
+        u64::try_from(count).expect("a drop count fits")
+    };
+    let mut previous_end = 0;
+    for (start, end) in recovery_episodes(&observations) {
+        let holes = holes_in(previous_end, end);
+        let bound = 2 * rto + holes * full_rtt;
+        assert!(
+            end - start <= bound,
+            "the episode from {start} ns lasted {} ns, over the {bound} ns that {holes} holes allow",
+            end - start
+        );
+        previous_end = end;
+    }
+    // One hole a round trip: each segment the buffer drops costs the flow
+    // at most one longest round trip of the bottleneck's time, so over
+    // the ProbeBW cycles after Startup the flow moves the bottleneck rate
+    // for all but those round trips.
+    let (from, to) = (seconds(1), seconds(9));
+    let lost_nanos = holes_in(from, to) * full_rtt;
+    let rate = path.bottleneck.bytes_per_second;
+    let floor = rate * (to - from).saturating_sub(lost_nanos) / (to - from);
+    let goodput = sim.goodput(from, to);
+    assert!(
+        goodput >= floor,
+        "goodput {goodput} B/s under the {floor} B/s that the dropped segments leave"
     );
 }
 
@@ -874,11 +1134,14 @@ fn rfc9438_w_cubic(w_max: f64, cwnd_epoch: f64, t: f64) -> f64 {
 /// queue stays empty and the round trip is the propagation delay.
 fn cubic_path(ack_policy: AckPolicy) -> Path {
     Path {
-        bottleneck_bytes_per_second: 12_500_000,
+        bottleneck: Bottleneck {
+            bytes_per_second: 12_500_000,
+            buffer_bytes: None,
+        },
+        change: None,
         rtt_nanos: 100 * MILLISECOND,
         ack_policy,
         budget: TcpSegmentBudget::wire_segments(TCP_WIRE_SEGMENT),
-        buffer_bytes: None,
     }
 }
 
