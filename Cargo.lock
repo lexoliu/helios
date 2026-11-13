@@ -4,16 +4,18 @@ version = 4
 
 [[package]]
 name = "acpi"
-version = "6.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b763acdc1d85c36d61acf97a59938f23202d0e8efe45e8759de10c02db242744"
+version = "7.0.0-pre1"
+source = "git+https://github.com/rust-osdev/acpi?branch=main#bd878824a20bd7af1386cc7daf861eb1aee50a5f"
 dependencies = [
  "bit_field",
  "bitflags 2.13.1",
  "byteorder",
+ "lock_api",
  "log",
  "pci_types",
+ "smallvec",
  "spinning_top",
+ "static_assertions",
 ]
 
 [[package]]
