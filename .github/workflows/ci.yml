@@ -2385,7 +2385,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libudev-dev just cmake ninja-build erofs-utils \
-            qemu-system-x86 ovmf swtpm
+            qemu-system-x86 ovmf swtpm socat
           qemu-system-x86_64 --version
           if [ -e /dev/kvm ]; then
             sudo chmod 666 /dev/kvm
@@ -2452,6 +2452,24 @@ jobs:
         with:
           name: smoke-x86-64-cpu-lifecycle-runtime
           path: smoke-runtime/cpu-lifecycle
+          if-no-files-found: ignore
+          retention-days: 14
+      # `-smp 2,maxcpus=4`: QMP `device_add` brings a vCPU online through
+      # SCI, GPE and AML Notify and `device_del` releases it, without a
+      # reboot (#497).
+      - name: Hot-add and hot-remove a vCPU through ACPI
+        timeout-minutes: 30
+        shell: bash
+        working-directory: helios
+        run: |
+          tools/cpu-lifecycle/hotplug.sh ./target/release/helios-inspector \
+            "$GITHUB_WORKSPACE/smoke-runtime/cpu-hotplug"
+      - name: Upload the hotplug runtime directory
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-x86-64-cpu-hotplug-runtime
+          path: smoke-runtime/cpu-hotplug
           if-no-files-found: ignore
           retention-days: 14
 
