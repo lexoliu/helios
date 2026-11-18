@@ -95,8 +95,15 @@ impl super::writer::RootUuids for FixtureUuids {
 pub(super) async fn mount_writer<S: crate::source::BlockSink>(
     source: S,
 ) -> Result<super::writer::Writer<S, FixtureUuids>, WriteError> {
-    super::writer::Writer::mount(source, FixtureUuids, NonZeroUsize::MIN).await
+    super::writer::Writer::mount(source, FixtureUuids, NonZeroUsize::MIN, MOUNTED).await
 }
+
+/// When a fixture's writer mounts: the time a log replay stamps.
+#[cfg(feature = "write")]
+pub(super) const MOUNTED: crate::Timestamp = crate::Timestamp {
+    seconds: 1_700_000_500,
+    nanoseconds: 250,
+};
 
 /// The committed allocation state of `fs`'s generation, loaded from disk.
 #[cfg(feature = "write")]

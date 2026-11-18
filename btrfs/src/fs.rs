@@ -303,10 +303,27 @@ impl<S: BlockSource> Filesystem<S> {
     /// does not implement, reads the chunk tree through the bootstrap
     /// chunks the superblock carries and checks the two agree, and finds
     /// the checksum tree and the default subvolume.
+    ///
+    /// A filesystem whose fsynced state is still in a log tree is refused
+    /// with [`Error::LogReplayRequired`]: its committed trees do not hold
+    /// that state, and only a writable mount replays the log.
     pub async fn mount(source: S) -> Result<Self, Error> {
         let selected = superblock::select(&source).await?;
+        selected.superblock.check_supported()?;
+        Self::open(source, selected).await
+    }
+
+    /// Mounts the last committed generation of `source`, whether or not a log
+    /// tree is pending behind it: what a writable mount replays the log into.
+    #[cfg(feature = "write")]
+    pub(crate) async fn mount_committed(source: S) -> Result<Self, Error> {
+        let selected = superblock::select(&source).await?;
+        selected.superblock.check_features()?;
+        Self::open(source, selected).await
+    }
+
+    async fn open(source: S, selected: superblock::SelectedSuperblock) -> Result<Self, Error> {
         let superblock = selected.superblock;
-        superblock.check_supported()?;
         let bootstrap = ChunkMap::from_sys_chunk_array(&superblock, &selected.bytes)?;
         let chunk_root = superblock.chunk_tree();
         let root_tree = TreeRoot {
@@ -834,5 +851,7 @@ async fn default_subvolume<S: BlockSource>(
 mod inline_tests;
 #[cfg(all(test, feature = "write"))]
 mod rename_tests;
+#[cfg(all(test, feature = "write"))]
+mod replay_tests;
 #[cfg(all(test, feature = "write"))]
 mod write_tests;

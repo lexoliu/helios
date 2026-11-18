@@ -145,6 +145,10 @@ pub enum WriteError {
     Chunk(#[from] crate::transaction::chunks::ChunkError),
     #[error("tree {tree} cannot grow beyond {MAX_LEVEL} levels")]
     Height { tree: u64 },
+    /// The log tree a crash left could not be replayed; the mount is refused
+    /// and the device keeps its last committed generation.
+    #[error("log replay: {0}")]
+    LogReplay(#[from] crate::transaction::replay::LogReplayError),
 }
 
 /// Allocation is transaction-owned: reservations, extent references and abort

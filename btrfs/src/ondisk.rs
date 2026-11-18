@@ -61,6 +61,10 @@ pub(crate) mod objectid {
     #[cfg(feature = "write")]
     pub(crate) const DEV_ITEMS: u64 = 1;
     pub(crate) const EXTENT_CSUM: u64 = -10_i64 as u64;
+    /// `BTRFS_TREE_LOG_OBJECTID`: the owner of every log tree block, and the
+    /// object id of the log root tree's root items.
+    #[cfg(feature = "write")]
+    pub(crate) const TREE_LOG: u64 = -6_i64 as u64;
 }
 
 /// Item types the read path consults.
@@ -71,6 +75,14 @@ pub(crate) mod item_type {
     #[cfg(feature = "write")]
     pub(crate) const INODE_EXTREF: u8 = 13;
     pub(crate) const XATTR_ITEM: u8 = 24;
+    /// `BTRFS_DIR_LOG_ITEM_KEY`: a log's directory-item range, which only
+    /// kernels before 5.17 wrote; replay reads index ranges alone.
+    #[cfg(feature = "write")]
+    pub(crate) const DIR_LOG_ITEM: u8 = 60;
+    /// `BTRFS_DIR_LOG_INDEX_KEY`: a range of directory indices the log is
+    /// authoritative for.
+    #[cfg(feature = "write")]
+    pub(crate) const DIR_LOG_INDEX: u8 = 72;
     pub(crate) const DIR_ITEM: u8 = 84;
     pub(crate) const DIR_INDEX: u8 = 96;
     pub(crate) const EXTENT_DATA: u8 = 108;

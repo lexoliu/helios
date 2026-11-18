@@ -8,4 +8,6 @@ mod read;
 mod walk;
 
 #[cfg(feature = "write")]
+mod log_replay;
+#[cfg(feature = "write")]
 mod writes;

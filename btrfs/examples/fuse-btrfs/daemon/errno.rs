@@ -98,6 +98,7 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::Space(SpaceError::Exhausted { .. }) => Errno::ENOSPC,
         WriteError::Space(SpaceError::Corrupt { .. }) => defect("Space::Corrupt", error),
         WriteError::Space(SpaceError::DataLength { .. }) => defect("Space::DataLength", error),
+        WriteError::Space(SpaceError::NotFree { .. }) => defect("Space::NotFree", error),
         WriteError::ForeignHandle => defect("ForeignHandle", error),
         WriteError::Encode(_) => defect("Encode", error),
         WriteError::CompressionWithoutChecksums => defect("CompressionWithoutChecksums", error),
@@ -117,5 +118,6 @@ pub fn write_errno(error: &WriteError) -> Errno {
         WriteError::RootUsage { .. } => defect("RootUsage", error),
         WriteError::MissingExtent { .. } => defect("MissingExtent", error),
         WriteError::Height { .. } => defect("Height", error),
+        WriteError::LogReplay(_) => defect("LogReplay", error),
     }
 }

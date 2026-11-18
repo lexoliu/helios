@@ -522,6 +522,7 @@ fn request(
             compress: None,
             commit: None,
             max_inline: None,
+            now: 1_700_000_000_000_000_000,
         },
     ))
     .map(drop)

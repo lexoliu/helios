@@ -70,7 +70,100 @@ pub(super) fn time(tree: u64, inode: u64, when: Timestamp) -> Result<RawTimespec
     })
 }
 
-fn entry_type(kind: FileKind) -> u8 {
+/// One name of an inode reference or extended reference item.
+#[derive(Clone, Copy)]
+pub(super) struct Reference<'a> {
+    pub(super) parent: u64,
+    pub(super) index: u64,
+    pub(super) name: &'a [u8],
+}
+
+/// The names an inode reference (`key` typed `INODE_REF`, its offset the
+/// parent) or extended reference item holds, each with the byte range it
+/// occupies, validated as it is reached.
+pub(super) fn references(
+    tree: u64,
+    key: Key,
+    bytes: &[u8],
+) -> impl Iterator<Item = Result<(core::ops::Range<usize>, Reference<'_>), Error>> {
+    let extended = key.item_type == item_type::INODE_EXTREF;
+    let header_size = if extended {
+        size_of::<RawInodeExtref>()
+    } else {
+        size_of::<RawInodeRef>()
+    };
+    let mut position = 0;
+    core::iter::from_fn(move || {
+        if position >= bytes.len() {
+            return None;
+        }
+        let payload = &bytes[position..];
+        let malformed = |defect| Error::Item { tree, key, defect };
+        let short = ItemDefect::Size {
+            needed: header_size,
+            found: payload.len(),
+        };
+        let fields = if extended {
+            view::<RawInodeExtref>(payload).map(|raw| {
+                (
+                    raw.parent.get(),
+                    raw.index.get(),
+                    usize::from(raw.name_len.get()),
+                )
+            })
+        } else {
+            view::<RawInodeRef>(payload)
+                .map(|raw| (key.offset, raw.index.get(), usize::from(raw.name_len.get())))
+        };
+        let Some((parent, index, length)) = fields else {
+            position = bytes.len();
+            return Some(Err(malformed(short)));
+        };
+        if length == 0 || length > NAME_MAX {
+            position = bytes.len();
+            return Some(Err(malformed(ItemDefect::NameLength(length))));
+        }
+        let end = position + header_size + length;
+        let Some(name) = bytes.get(position + header_size..end) else {
+            position = bytes.len();
+            return Some(Err(malformed(ItemDefect::Size {
+                needed: header_size + length,
+                found: payload.len(),
+            })));
+        };
+        let range = position..end;
+        position = end;
+        Some(Ok((
+            range,
+            Reference {
+                parent,
+                index,
+                name,
+            },
+        )))
+    })
+}
+
+/// A directory item or index record naming `inode` of `kind`, written in
+/// transaction `transid`.
+pub(super) fn entry_record(inode: u64, kind: FileKind, transid: u64, name: &[u8]) -> Vec<u8> {
+    let record = RawDirItem {
+        location: RawKey {
+            objectid: inode.into(),
+            item_type: item_type::INODE_ITEM,
+            offset: 0.into(),
+        },
+        transid: transid.into(),
+        data_len: 0.into(),
+        name_len: (name.len() as u16).into(),
+        entry_type: entry_type(kind),
+    };
+    let mut bytes = Vec::from(record.as_bytes());
+    bytes.extend_from_slice(name);
+    bytes
+}
+
+pub(super) fn entry_type(kind: FileKind) -> u8 {
     match kind {
         FileKind::Regular => 1,
         FileKind::Directory => 2,
@@ -408,7 +501,7 @@ impl<S: BlockSink> Transaction<S> {
         Ok(())
     }
 
-    async fn put_item(
+    pub(super) async fn put_item(
         &mut self,
         tree: u64,
         key: Key,
@@ -733,7 +826,7 @@ impl<S: BlockSink> Transaction<S> {
         self.put_inode(tree, parent, directory).await
     }
 
-    async fn without_reference(
+    pub(super) async fn without_reference(
         &self,
         tree: u64,
         parent: u64,
@@ -748,52 +841,17 @@ impl<S: BlockSink> Transaction<S> {
             let Some(mut bytes) = self.trees.get(&self.volume, root, key).await? else {
                 continue;
             };
-            let mut position = 0;
-            while position < bytes.len() {
-                let payload = &bytes[position..];
-                let extended = key.item_type == item_type::INODE_EXTREF;
-                let header_size = if extended {
-                    size_of::<RawInodeExtref>()
-                } else {
-                    size_of::<RawInodeRef>()
-                };
-                let malformed = |defect| Error::Item { tree, key, defect };
-                let (record_parent, index, length) = if extended {
-                    let raw = view::<RawInodeExtref>(payload).ok_or_else(|| {
-                        malformed(ItemDefect::Size {
-                            needed: header_size,
-                            found: payload.len(),
-                        })
-                    })?;
-                    (
-                        raw.parent.get(),
-                        raw.index.get(),
-                        usize::from(raw.name_len.get()),
-                    )
-                } else {
-                    let raw = view::<RawInodeRef>(payload).ok_or_else(|| {
-                        malformed(ItemDefect::Size {
-                            needed: header_size,
-                            found: payload.len(),
-                        })
-                    })?;
-                    (parent, raw.index.get(), usize::from(raw.name_len.get()))
-                };
-                if length == 0 || length > NAME_MAX {
-                    return Err(malformed(ItemDefect::NameLength(length)).into());
+            let mut found = None;
+            for record in references(tree, key, &bytes) {
+                let (range, record) = record?;
+                if record.parent == parent && record.name == name {
+                    found = Some((range, record.index));
+                    break;
                 }
-                let end = position + header_size + length;
-                let record_name = bytes.get(position + header_size..end).ok_or_else(|| {
-                    malformed(ItemDefect::Size {
-                        needed: header_size + length,
-                        found: payload.len(),
-                    })
-                })?;
-                if record_parent == parent && record_name == name {
-                    bytes.drain(position..end);
-                    return Ok((key, index, bytes));
-                }
-                position = end;
+            }
+            if let Some((range, index)) = found {
+                bytes.drain(range);
+                return Ok((key, index, bytes));
             }
         }
         Err(WriteError::NamespaceMismatch {
@@ -875,20 +933,7 @@ impl<S: BlockSink> Transaction<S> {
                 .checked_add(2 * name.len() as u64)
                 .ok_or(WriteError::FileOverflow)?,
         );
-        let location = RawKey {
-            objectid: inode.into(),
-            item_type: item_type::INODE_ITEM,
-            offset: 0.into(),
-        };
-        let record = RawDirItem {
-            location,
-            transid: self.trees.generation().into(),
-            data_len: 0.into(),
-            name_len: (name.len() as u16).into(),
-            entry_type: entry_type(kind),
-        };
-        let mut bytes = Vec::from(record.as_bytes());
-        bytes.extend_from_slice(name);
+        let bytes = entry_record(inode, kind, self.trees.generation(), name);
         names.extend_from_slice(&bytes);
         let (reference_key, reference) =
             self.new_reference(tree, parent, inode, index, name).await?;
@@ -930,7 +975,7 @@ impl<S: BlockSink> Transaction<S> {
         self.put_inode(tree, inode, raw).await
     }
 
-    async fn new_reference(
+    pub(super) async fn new_reference(
         &self,
         tree: u64,
         parent: u64,

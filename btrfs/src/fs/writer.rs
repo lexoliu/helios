@@ -42,6 +42,7 @@ use crate::source::BlockSink;
 use crate::transaction::file::WriteOptions;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
+use crate::transaction::replay::PendingLog;
 use crate::transaction::reserve::Units;
 use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
@@ -219,9 +220,25 @@ struct Running<S> {
 impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// Mounts `source` for writing. Every commit takes root UUIDs from
     /// `uuids` and keeps at most `concurrency` block writes in flight.
-    pub async fn mount(source: S, uuids: U, concurrency: NonZeroUsize) -> Result<Self, WriteError> {
-        let current = Filesystem::mount(Arc::new(source)).await?;
+    ///
+    /// A log tree a crash left behind an fsync is replayed first, in one
+    /// transaction that this call commits before it returns, as Linux's
+    /// `btrfs_recover_log_trees` does at mount; `now` is the time that
+    /// replay stamps on what its unlinks change. A log that cannot be
+    /// replayed refuses the mount, and the device keeps its last committed
+    /// generation.
+    pub async fn mount(
+        source: S,
+        uuids: U,
+        concurrency: NonZeroUsize,
+        now: Timestamp,
+    ) -> Result<Self, WriteError> {
+        let current = Filesystem::mount_committed(Arc::new(source)).await?;
         current.superblock().check_writable()?;
+        let log = current
+            .superblock()
+            .log_tree()
+            .map(|(bytenr, level)| PendingLog { bytenr, level });
         // Linux enables quotas by creating the quota tree. Its qgroup counts
         // go stale under any write this writer makes, so refuse until the
         // writer maintains them (lexoliu/helios#1043).
@@ -237,7 +254,7 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             Err(error) => return Err(error.into()),
         }
         let allocation = Allocation::load(&current.volume, current.snapshot.root_tree).await?;
-        Ok(Self {
+        let mut writer = Self {
             committed: Some(current),
             allocation,
             retirements: Retirements::default(),
@@ -245,7 +262,27 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
             mount: Arc::new(MountIdentity),
             uuids,
             concurrency,
-        })
+        };
+        if let Some(log) = log {
+            writer.replay(log, now).await?;
+        }
+        Ok(writer)
+    }
+
+    /// Replays `log` in a transaction of its own and commits it, which
+    /// clears the superblock's log root even when the replay changed
+    /// nothing else. Linux reserves nothing up front for it
+    /// (`btrfs_start_transaction(tree_root, 0)`), so only the commit's own
+    /// hold is checked.
+    async fn replay(&mut self, log: PendingLog, now: Timestamp) -> Result<(), WriteError> {
+        self.start().await?;
+        let running = self
+            .running
+            .as_mut()
+            .expect("a transaction runs once started");
+        running.inner.replay_log(log, now).await?;
+        running.inner.check_commit_hold(Units::default())?;
+        self.commit_running().await
     }
 
     /// The space the filesystem has, and what it uses once the running
@@ -330,16 +367,28 @@ impl<S: BlockSink, U: RootUuids> Writer<S, U> {
     /// the future before it finishes, poisons the writer instead of
     /// discarding them; the device keeps the previous generation.
     pub async fn commit(&mut self) -> Result<(), WriteError> {
+        if self.committed.is_none() {
+            return Err(WriteError::WriterPoisoned);
+        }
+        if self
+            .running
+            .as_ref()
+            .is_none_or(|running| running.inner.dirty_metadata_bytes() == 0)
+        {
+            // A clean transaction holds nothing the last commit did not.
+            self.running = None;
+            return Ok(());
+        }
+        self.commit_running().await
+    }
+
+    /// Commits the running transaction, whatever it holds.
+    async fn commit_running(&mut self) -> Result<(), WriteError> {
         let mut current = self.committed.take().ok_or(WriteError::WriterPoisoned)?;
-        let Some(running) = self
+        let running = self
             .running
             .take()
-            .filter(|running| running.inner.dirty_metadata_bytes() != 0)
-        else {
-            // A clean transaction holds nothing the last commit did not.
-            self.committed = Some(current);
-            return Ok(());
-        };
+            .expect("the caller commits a running transaction");
         let uuids = &mut self.uuids;
         let mut committed = running
             .inner

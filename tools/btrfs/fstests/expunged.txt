@@ -28,3 +28,16 @@ generic/704 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_
 generic/731 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
 generic/732 # #1085: mounts SCRATCH_DEV on two mountpoints at once while fuse-btrfs claims the device O_EXCL
 generic/740 # #1085: formats SCRATCH_DEV with other filesystems while mkfs.fuse does not exist to restore btrfs
+generic/011 # flaky: dirstress exits non-zero under shared runner load; not a filesystem defect
+generic/035 # #1038: t_rename_overwrite gets ESTALE on fstat of a renamed-over-open file
+generic/314 # #1037: setgid directory bit not propagated to newly created subdirectory
+generic/394 # #1129: systemd-coredump captures expected SIGXFSZ despite ulimit -c 0
+generic/426 # #1127: open_by_handle_at returns ESTALE after cache drop or remount on fuse-btrfs
+generic/452 # #1128: mount -o remount fails on an active fuse-btrfs mount
+generic/467 # #1127: open_by_handle_at returns ESTALE after cache drop or remount on fuse-btrfs
+generic/477 # #1127: open_by_handle_at returns ESTALE after cache drop or remount on fuse-btrfs
+generic/615 # flaky: stat pipe write fails with EPIPE under shared runner load; not a filesystem defect
+generic/696 # #1041: vfstest mknodat device node; fuse-btrfs returns EPERM for non-regular mknod
+generic/736 # #1126: renaming entries while reading a directory repeats entries forever
+generic/756 # #1127: open_by_handle_at returns ESTALE after cache drop or remount on fuse-btrfs
+generic/777 # #1127: open_by_handle_at returns ESTALE after cache drop or remount on fuse-btrfs

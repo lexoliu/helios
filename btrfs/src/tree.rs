@@ -73,6 +73,18 @@ impl Node {
         logical: u64,
         expected: Expected,
     ) -> Result<Self, Error> {
+        Self::read_until(volume, logical, expected, volume.superblock().generation()).await
+    }
+
+    /// [`Self::read`] of a block that may be newer than the superblock, up to
+    /// generation `newest`: a log tree's blocks belong to the transaction
+    /// after the last commit, as `btrfs_replay_log` reads them.
+    pub(crate) async fn read_until<S: BlockSource>(
+        volume: &Volume<S>,
+        logical: u64,
+        expected: Expected,
+        newest: u64,
+    ) -> Result<Self, Error> {
         let superblock = volume.superblock();
         let nodesize = superblock.nodesize() as usize;
         let mut bytes = Arc::<[u8]>::from_iter(repeat_n(0, nodesize));
@@ -81,7 +93,7 @@ impl Node {
                 logical,
                 Arc::get_mut(&mut bytes).expect("unpublished node"),
                 |block| {
-                    validate(block, logical, expected, superblock)
+                    validate(block, logical, expected, superblock, newest)
                         .map_err(|defect| Error::TreeBlock { logical, defect })
                 },
             )
@@ -154,12 +166,14 @@ impl Node {
     }
 }
 
-/// Every check a tree block must pass. Returns the item count.
+/// Every check a tree block must pass, none of its generation above
+/// `newest`. Returns the item count.
 fn validate(
     bytes: &[u8],
     logical: u64,
     expected: Expected,
     superblock: &Superblock,
+    newest: u64,
 ) -> Result<usize, NodeDefect> {
     let header: &RawHeader = view(bytes).ok_or(NodeDefect::ItemCount { nritems: 0 })?;
     if !superblock
@@ -183,10 +197,10 @@ fn validate(
         });
     }
     let generation = header.generation.get();
-    if generation > superblock.generation() {
+    if generation > newest {
         return Err(NodeDefect::FutureGeneration {
             found: generation,
-            superblock: superblock.generation(),
+            superblock: newest,
         });
     }
     if generation != expected.generation {

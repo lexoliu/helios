@@ -141,6 +141,10 @@ impl CommitImage {
         raw.root.set(roots.root.bytenr);
         raw.root_level = roots.root.level;
         raw.bytes_used.set(used);
+        // Every commit holds what any log tree held, so it points at none,
+        // as `btrfs_commit_transaction` clears them.
+        raw.log_root.set(0);
+        raw.log_root_level = 0;
         raw.flags.set(raw.flags.get() | 1); // BTRFS_SUPER_FLAG_WRITTEN.
         // Existing v1 free-space cache inodes are stale after our CoW edits.
         raw.cache_generation.set(0);

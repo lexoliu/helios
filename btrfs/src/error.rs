@@ -47,7 +47,8 @@ pub enum Error {
     )]
     UnsupportedProfile { logical: u64, profile: &'static str },
     /// The filesystem holds a log tree that must be replayed before its
-    /// trees describe the fsynced state; replay is not implemented.
+    /// trees describe the fsynced state. A read-only mount refuses it; a
+    /// writable mount (`write::Writer`) replays it.
     #[error("the filesystem has an unreplayed log tree at logical {log_root:#x}")]
     LogReplayRequired { log_root: u64 },
     /// The bootstrap chunk array in the superblock is malformed.

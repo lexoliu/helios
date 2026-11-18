@@ -178,6 +178,31 @@ impl Roots {
         Ok(())
     }
 
+    /// Whether tree `tree` is a subvolume that is still referenced: one
+    /// `btrfs_get_fs_root` opens when asked to check its root refs.
+    #[cfg(feature = "write")]
+    pub(crate) fn is_live(&self, tree: u64) -> bool {
+        self.entries.get(&tree).is_some_and(|entry| {
+            view::<RawRootItem>(&entry.bytes)
+                .expect("validated root item")
+                .refs
+                .get()
+                != 0
+        })
+    }
+
+    /// Has the commit rewrite tree `tree`'s root item even when the tree did
+    /// not move, as `btrfs_record_root_in_trans` does: the root tree then
+    /// changes, so the commit publishes a new generation.
+    #[cfg(feature = "write")]
+    pub(crate) fn record_in_transaction(&mut self, tree: u64) -> Result<(), WriteError> {
+        self.entries
+            .get_mut(&tree)
+            .ok_or(Error::MissingRoot { tree })?
+            .dirty = true;
+        Ok(())
+    }
+
     pub(crate) fn set(&mut self, root: TreeRoot) -> Result<(), WriteError> {
         self.entries
             .get_mut(&root.tree)

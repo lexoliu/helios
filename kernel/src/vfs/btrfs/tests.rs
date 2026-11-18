@@ -86,6 +86,7 @@ fn write_options(
         compress,
         commit: None,
         max_inline: None,
+        now: 1_700_000_000_000_000_000,
     }
 }
 
@@ -386,6 +387,7 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
             compress: None,
             commit: None,
             max_inline: None,
+            now: 1_700_000_000_000_000_000,
         },
     ))
     .expect("mount request");
@@ -433,6 +435,7 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
             compress: None,
             commit: None,
             max_inline: None,
+            now: 1_700_000_000_000_000_000,
         },
     ))
     .expect("mount request")

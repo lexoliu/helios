@@ -174,6 +174,7 @@ macro_rules! impl_mount_bindings {
                                     .commit
                                     .map(crate::vfs::CommitPolicy::from_commit_option),
                                 max_inline: request.max_inline,
+                                now: store.now_nanos(),
                             },
                             store.spawner().launch_spawner().clone(),
                             store.timer(),

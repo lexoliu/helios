@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Runs the unmodified upstream fstests `generic/quick` group against Helios's
-# btrfs writer, mounted through FUSE by the `fuse-btrfs` example, then checks
-# both test devices with `btrfs check` and runs the crash-consistency replay
-# of crash.sh. Needs root (losetup, mount, dmsetup) and the build dependencies
-# of fstests, btrfs-progs and fuse3.
+# Replays the pending-log images of log-replay.sh against Linux's own replay,
+# runs the unmodified upstream fstests `generic/quick` group against Helios's
+# btrfs writer mounted through FUSE by the `fuse-btrfs` example, then checks
+# both test devices with `btrfs check` and runs the crash-consistency replay of
+# crash.sh. Needs root (losetup, mount, dmsetup) and the build dependencies of
+# fstests, btrfs-progs and fuse3.
 #
 # fstests has no mkfs or fsck for FSTYP=fuse, so this formats the devices with
 # mkfs.btrfs and checks them with `btrfs check --readonly` itself.
@@ -60,6 +61,50 @@ cleanup() {
     chmod -R a+rX "$results"
 }
 
+# Runs the Rust log-replay comparison and `btrfs check` test over $1, dropping
+# back to $SUDO_USER when sudo started this script so target/ keeps its owner
+# and reuses the FUSE build's artifacts.
+run_log_replay_tests() {
+    local images=$1 cargo_bin cargo_home rustup_home
+    cargo_bin=$(type -P cargo) || {
+        echo "fstests: cargo is not on PATH" >&2
+        return 1
+    }
+    local env_args=("PATH=$PATH" "HELIOS_BTRFS_LOG_IMAGES=$images")
+    if [[ -n "${CARGO_HOME:-}" ]]; then
+        env_args+=("CARGO_HOME=$CARGO_HOME")
+    else
+        cargo_home=$(cd -P "$(dirname "$cargo_bin")/.." && pwd)
+        if [[ "$(basename "$cargo_home")" == .cargo ]]; then
+            env_args+=("CARGO_HOME=$cargo_home")
+        fi
+    fi
+    if [[ -n "${RUSTUP_HOME:-}" ]]; then
+        env_args+=("RUSTUP_HOME=$RUSTUP_HOME")
+    else
+        rustup_home=$(cd -P "$(dirname "$cargo_bin")/../.." && pwd)/.rustup
+        if [[ -d "$rustup_home" ]]; then
+            env_args+=("RUSTUP_HOME=$rustup_home")
+        fi
+    fi
+    local profile_args=()
+    if [[ "$HELIOS_FUSE_BTRFS" == */release/* ]]; then
+        profile_args=(--release)
+    fi
+    local cmd=(
+        "$cargo_bin" test --locked -p helios-btrfs "${profile_args[@]}"
+        --features "write,test-support" --test images log_replay::
+        -- --ignored --nocapture
+    )
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != root ]]; then
+        (cd "$root" && sudo -H -u "$SUDO_USER" env "${env_args[@]}" "${cmd[@]}") 2>&1 |
+            tee "$results/log-replay.log"
+    else
+        (cd "$root" && env "${env_args[@]}" "${cmd[@]}") 2>&1 |
+            tee "$results/log-replay.log"
+    fi
+}
+
 # Sets `loop` to a loop device backed by a new sparse file of the given size.
 # Not a command substitution: the device must reach `loops` for the cleanup.
 make_loop() {
@@ -104,6 +149,17 @@ for user in fsgqa 123456-fsgqa fsgqa2; do
 done
 
 failed=()
+
+# Linux's btrfs, not the FUSE mount, makes these: images with a log pending,
+# which the unprivileged log replay tests read from $work/log-replay and hold
+# to Linux's own replay and `btrfs check`.
+echo "== log replay"
+if "$here/log-replay.sh" "$work/log-replay"; then
+    chmod a+rx "$work"
+    run_log_replay_tests "$work/log-replay" || failed+=("log_replay comparison failed")
+else
+    failed+=("log-replay.sh failed")
+fi
 
 echo "== fstests generic/quick"
 check_status=0

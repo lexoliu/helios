@@ -41,6 +41,10 @@ pub enum SpaceError {
     Exhausted { bytes: u64, flags: u64 },
     #[error("data reservation length {bytes} must be a nonzero multiple of sector size {sector}")]
     DataLength { bytes: u64, sector: u64 },
+    /// A data extent claimed at a given address is not free there: outside
+    /// every data block group, unaligned, or overlapping an allocation.
+    #[error("data range {address:#x}+{bytes:#x} is not free in a data block group")]
+    NotFree { address: u64, bytes: u64 },
 }
 
 #[derive(Debug, Error)]
@@ -594,6 +598,71 @@ impl Space {
         let address = self.reserve(length, DATA)?;
         self.data.insert_mut(address, length);
         Ok(address)
+    }
+
+    /// Reserves the data extent at `address`, which another writer already
+    /// filled: Linux's `btrfs_alloc_logged_file_extent`, which takes a logged
+    /// extent out of the free space (`__exclude_logged_extent`) and accounts
+    /// it to its block group. The range may have been excluded by [`Self::pin`]
+    /// beforehand, as a mixed block group's logged extents are; every other
+    /// byte of it must be free.
+    pub(crate) fn reserve_data_at(&mut self, address: u64, length: u64) -> Result<(), SpaceError> {
+        let not_free = || SpaceError::NotFree {
+            address,
+            bytes: length,
+        };
+        let end = address.checked_add(length).ok_or_else(not_free)?;
+        if length == 0
+            || !address.is_multiple_of(self.sector)
+            || !length.is_multiple_of(self.sector)
+        {
+            return Err(not_free());
+        }
+        let range = address..end;
+        let index = self
+            .groups
+            .iter()
+            .position(|group| group.flags & DATA != 0 && group.contains(&range))
+            .ok_or_else(not_free)?;
+        let group = &self.groups[index];
+        let pinned: Vec<Range<u64>> = group
+            .excluded_free
+            .iter()
+            .filter(|excluded| excluded.start < end && address < excluded.end)
+            .map(|excluded| excluded.start.max(address)..excluded.end.min(end))
+            .collect();
+        let mut free = Vec::new();
+        let mut next = address;
+        for part in &pinned {
+            if next < part.start {
+                free.push(next..part.start);
+            }
+            next = part.end;
+        }
+        if next < end {
+            free.push(next..end);
+        }
+        let fits = free.iter().all(|part| {
+            group
+                .free
+                .iter()
+                .any(|range| range.start <= part.start && part.end <= range.end)
+        });
+        if !fits {
+            return Err(not_free());
+        }
+        let group = &mut self.groups[index];
+        for part in pinned {
+            assert!(
+                group.excluded_free.occupy(part),
+                "a pinned part is excluded"
+            );
+        }
+        for part in free {
+            assert!(group.free.occupy(part), "a checked part is free");
+        }
+        self.data.insert_mut(address, length);
+        Ok(())
     }
 
     /// Only unpublished allocations can be canceled. A committed extent must

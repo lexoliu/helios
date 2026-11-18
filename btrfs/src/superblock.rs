@@ -68,6 +68,7 @@ pub struct Superblock {
     root: RootPointer,
     chunk_root: RootPointer,
     log_root: u64,
+    log_root_level: u8,
     total_bytes: u64,
     bytes_used: u64,
     num_devices: u64,
@@ -123,9 +124,12 @@ impl Superblock {
                 return Err(SuperblockDefect::Unaligned { field, value });
             }
         }
+        // `btrfs_validate_super` checks the log root's level as it checks
+        // the other roots', whether or not a log is pending.
         for (field, level) in [
             ("root_level", raw.root_level),
             ("chunk_root_level", raw.chunk_root_level),
+            ("log_root_level", raw.log_root_level),
         ] {
             if level >= MAX_LEVEL {
                 return Err(SuperblockDefect::Level { field, level });
@@ -170,6 +174,7 @@ impl Superblock {
                 generation: raw.chunk_root_generation.get(),
             },
             log_root: raw.log_root.get(),
+            log_root_level: raw.log_root_level,
             total_bytes: raw.total_bytes.get(),
             bytes_used: raw.bytes_used.get(),
             num_devices: raw.num_devices.get(),
@@ -187,8 +192,21 @@ impl Superblock {
     }
 
     /// Refuses a valid superblock describing a filesystem this crate does
-    /// not read.
+    /// not read as it stands: one with a feature it does not implement, or
+    /// one whose fsynced state is still in a log tree. Only a writable mount
+    /// replays the log.
     pub(crate) fn check_supported(&self) -> Result<(), Error> {
+        self.check_features()?;
+        if self.log_root != 0 {
+            return Err(Error::LogReplayRequired {
+                log_root: self.log_root,
+            });
+        }
+        Ok(())
+    }
+
+    /// Refuses a filesystem with a feature this crate does not implement.
+    pub(crate) fn check_features(&self) -> Result<(), Error> {
         let mut unknown = self.incompat_flags;
         for (bit, name, supported) in INCOMPAT_FEATURES {
             if self.incompat_flags & bit != 0 && !supported {
@@ -208,12 +226,14 @@ impl Superblock {
                 devices: self.num_devices,
             });
         }
-        if self.log_root != 0 {
-            return Err(Error::LogReplayRequired {
-                log_root: self.log_root,
-            });
-        }
         Ok(())
+    }
+
+    /// The log root tree a crash left behind an fsync, as its logical
+    /// address and level: `None` when no log is pending.
+    #[cfg(feature = "write")]
+    pub(crate) fn log_tree(&self) -> Option<(u64, u8)> {
+        (self.log_root != 0).then_some((self.log_root, self.log_root_level))
     }
 
     /// COMPAT_RO explicitly permits readers that do not implement a feature,
