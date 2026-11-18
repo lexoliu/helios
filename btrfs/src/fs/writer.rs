@@ -43,6 +43,7 @@ use crate::transaction::file::WriteOptions;
 use crate::transaction::namespace::{Attributes as RawAttributes, Name as RawName};
 use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
 use crate::transaction::reserve::Units;
+use crate::transaction::xattr::XattrMode;
 use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
 use crate::{Error, FileKind, Metadata, Timestamp};
@@ -136,9 +137,17 @@ impl InodeHandle {
 /// by create_file, create_directory or symlink, never by permission bits.
 #[derive(Clone, Copy, Debug)]
 pub struct Attributes {
+    /// The mode bits asked for, before the umask.
     pub permissions: u32,
     pub uid: u32,
+    /// The creating process's group; overridden by the parent directory's
+    /// when the parent carries `S_ISGID`, as `inode_init_owner` does.
     pub gid: u32,
+    /// The creating process's umask. As in Linux's `posix_acl_create`, it
+    /// narrows `permissions` only when the parent directory has no default
+    /// ACL; a default ACL narrows them instead, and the new inode inherits
+    /// it.
+    pub umask: u32,
 }
 
 impl Attributes {
@@ -152,6 +161,7 @@ impl Attributes {
             mode: kind | self.permissions,
             uid: self.uid,
             gid: self.gid,
+            umask: self.umask,
         })
     }
 }
@@ -628,14 +638,15 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     /// Replaces the permission bits (`07777`, with the set-id bits refused on
-    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`.
+    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`. An
+    /// access ACL's base entries follow the new bits.
     pub async fn set_permissions(
         &mut self,
         file: &InodeHandle,
         permissions: u32,
         changed: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::INODE_UPDATE).await?;
+        let mut operation = Mutation::new(self, Units::MODE).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner_mut().roots.check_writable(file.tree)?;
@@ -647,7 +658,8 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
     }
 
     /// Changes the owner and the group, each left as it is when `None`, and
-    /// stamps `changed`. A non-directory loses its set-id bits.
+    /// stamps `changed`. A non-directory loses its set-id bits and its
+    /// `security.capability`.
     pub async fn set_owner(
         &mut self,
         file: &InodeHandle,
@@ -655,13 +667,90 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         gid: Option<u32>,
         changed: Timestamp,
     ) -> Result<(), WriteError> {
-        let mut operation = Mutation::new(self, Units::INODE_UPDATE).await?;
+        let mut operation = Mutation::new(self, Units::OWNER).await?;
         operation.checked(file).await?;
         let file = file.id;
         operation.inner_mut().roots.check_writable(file.tree)?;
         operation
             .inner_mut()
             .set_owner(file.tree, file.inode, uid, gid, changed)
+            .await?;
+        operation.accept()
+    }
+
+    /// `getxattr(2)`: the length of `name`'s value, which is also copied to
+    /// `output` unless `output` is empty (a size query). A nonempty `output`
+    /// shorter than the value is [`WriteError::XattrBuffer`] (`ERANGE`), a
+    /// bare handler prefix is [`WriteError::XattrName`] (`EINVAL`), an
+    /// unhandled namespace is [`WriteError::XattrNamespace`] (`EOPNOTSUPP`),
+    /// and an absent attribute is [`WriteError::XattrMissing`] (`ENODATA`).
+    pub async fn xattr(
+        &self,
+        file: &InodeHandle,
+        name: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, WriteError> {
+        self.checked(file).await?;
+        self.inner()
+            .xattr(file.tree(), file.number(), name, output)
+            .await
+    }
+
+    /// `listxattr(2)`: every attribute name of `file`, each followed by a NUL,
+    /// copied to `output` unless it is empty (a size query). Returns the
+    /// bytes the names take.
+    pub async fn list_xattrs(
+        &self,
+        file: &InodeHandle,
+        output: &mut [u8],
+    ) -> Result<usize, WriteError> {
+        self.checked(file).await?;
+        self.inner()
+            .list_xattrs(file.tree(), file.number(), output)
+            .await
+    }
+
+    /// `setxattr(2)`. Every namespace Linux's btrfs stores is written:
+    /// `user.*` (on regular files, directories and sockets only, else
+    /// [`WriteError::XattrNotPermitted`]), `security.*`, `trusted.*` and the
+    /// two POSIX ACL names, which are validated, stored in the encoding
+    /// `posix_acl_to_xattr` produces and, for the access ACL, set the mode's
+    /// permission bits as `btrfs_set_acl` does. Any other namespace is
+    /// [`WriteError::XattrNamespace`]. The inode's ctime becomes `changed`.
+    /// Whether the caller may write the namespace is not checked here.
+    pub async fn set_xattr(
+        &mut self,
+        file: &InodeHandle,
+        name: &[u8],
+        value: &[u8],
+        mode: XattrMode,
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self, Units::XATTR).await?;
+        operation.checked(file).await?;
+        operation.inner_mut().roots.check_writable(file.tree())?;
+        operation
+            .inner_mut()
+            .set_xattr(file.tree(), file.number(), name, value, mode, changed)
+            .await?;
+        operation.accept()
+    }
+
+    /// `removexattr(2)`, under the rules of [`Self::set_xattr`]; an absent
+    /// attribute is [`WriteError::XattrMissing`], except an absent ACL,
+    /// whose removal succeeds as `vfs_remove_acl`'s does.
+    pub async fn remove_xattr(
+        &mut self,
+        file: &InodeHandle,
+        name: &[u8],
+        changed: Timestamp,
+    ) -> Result<(), WriteError> {
+        let mut operation = Mutation::new(self, Units::XATTR).await?;
+        operation.checked(file).await?;
+        operation.inner_mut().roots.check_writable(file.tree())?;
+        operation
+            .inner_mut()
+            .remove_xattr(file.tree(), file.number(), name, changed)
             .await?;
         operation.accept()
     }
@@ -690,7 +779,17 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         attributes: RawAttributes,
         when: Timestamp,
     ) -> Result<InodeHandle, WriteError> {
-        let mut operation = Mutation::new(self, Units::CREATE).await?;
+        let parent = self.entry_name(name).await?;
+        let units = if self
+            .inner()
+            .has_default_acl(parent.tree, parent.parent)
+            .await?
+        {
+            Units::CREATE_INHERITING_ACLS
+        } else {
+            Units::CREATE
+        };
+        let mut operation = Mutation::new(self, units).await?;
         let name = operation.entry_name(name).await?;
         operation.inner_mut().roots.check_writable(name.tree)?;
         let inode = operation

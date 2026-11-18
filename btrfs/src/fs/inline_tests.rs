@@ -54,6 +54,7 @@ fn attributes() -> Attributes {
         permissions: 0o644,
         uid: 1000,
         gid: 1000,
+        umask: 0,
     }
 }
 

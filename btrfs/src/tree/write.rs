@@ -86,6 +86,40 @@ pub enum WriteError {
     #[error("directory hard links are not permitted")]
     DirectoryLink,
 
+    #[error("extended attribute names are 1..=255 bytes (got {length})")]
+    XattrNameLength { length: usize },
+    #[error("extended attribute name is a namespace prefix with no name after it")]
+    XattrName,
+    #[error("extended attribute value of {length} bytes exceeds {maximum}")]
+    XattrValueTooBig { length: usize, maximum: usize },
+    #[error("extended attribute data of {bytes} bytes exceeds the {maximum} one leaf item holds")]
+    XattrNoSpace { bytes: usize, maximum: usize },
+    #[error("inode {inode} in tree {tree} has no such extended attribute")]
+    XattrMissing { tree: u64, inode: u64 },
+    #[error("inode {inode} in tree {tree} already has this extended attribute")]
+    XattrExists { tree: u64, inode: u64 },
+    #[error("extended attributes need {needed} bytes of buffer, got {provided}")]
+    XattrBuffer { needed: usize, provided: usize },
+    /// Writing `user.*` on a file that is not regular, a directory or a socket.
+    #[error("inode {inode} in tree {tree} takes no user.* attributes")]
+    XattrNotPermitted { tree: u64, inode: u64 },
+    #[error("extended attribute namespace has no handler")]
+    XattrNamespace,
+    /// A POSIX ACL value `posix_acl_from_xattr` or `posix_acl_valid` refuses
+    /// (`EINVAL`).
+    #[error("POSIX ACL value is malformed or its entries are invalid")]
+    AclInvalid,
+    /// A POSIX ACL value of a version other than `POSIX_ACL_XATTR_VERSION`
+    /// (`EOPNOTSUPP`).
+    #[error("POSIX ACL version {version} is not supported")]
+    AclVersion { version: u32 },
+    /// A POSIX ACL on a symlink, which has no ACL operations (`EOPNOTSUPP`).
+    #[error("inode {inode} in tree {tree} is a symlink, which takes no POSIX ACL")]
+    AclNotSupported { tree: u64, inode: u64 },
+    /// A default ACL on a non-directory (`EACCES`, `set_posix_acl`).
+    #[error("inode {inode} in tree {tree} is not a directory and takes no default ACL")]
+    AclDefaultNotDirectory { tree: u64, inode: u64 },
+
     #[error("file offset or inode byte accounting overflows")]
     FileOverflow,
     #[error("file extent {key} is not a regular or preallocated mapping")]

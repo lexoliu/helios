@@ -10,7 +10,7 @@
 //! - `setattr` changing the file flags: `EOPNOTSUPP`
 //! - `setattr` or a creation giving a non-directory S_ISUID or S_ISGID: `EPERM`
 //! - `mknod` of anything but a regular file: `EPERM`
-//! - `setxattr`, `removexattr`, `fallocate`: `EOPNOTSUPP`
+//! - `fallocate`: `EOPNOTSUPP`
 //! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
 //!   `RENAME_EXCHANGE`: `EINVAL`
 //!
@@ -22,9 +22,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, LockOwner, RenameFlags,
-    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, InitFlags, KernelConfig,
+    LockOwner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use futures_lite::future::block_on;
 use helios_btrfs::Timestamp;
@@ -64,12 +64,29 @@ fn now() -> Timestamp {
     timestamp(SystemTime::now())
 }
 
-/// A new node's permission bits: what the caller asked for, less its umask.
-fn permissions(mode: u32, umask: u32) -> u32 {
-    mode & !umask & 0o7777
+/// A new node's permission bits as the caller asked for them. The kernel
+/// leaves the umask to the filesystem (`FUSE_DONT_MASK`), which applies it
+/// as Linux's `posix_acl_create` does: only when the parent has no default
+/// ACL.
+fn permissions(mode: u32) -> u32 {
+    mode & 0o7777
 }
 
 impl Filesystem for Daemon {
+    /// Asks for `FUSE_POSIX_ACL`, under which the kernel enforces POSIX ACLs
+    /// with `default_permissions` as it does for a local filesystem
+    /// (`process_init_reply` in `fs/fuse/inode.c` sets both), and
+    /// `FUSE_DONT_MASK`, so a creation arrives with its umask unapplied for
+    /// the writer's `posix_acl_create`. A kernel without either fails the
+    /// mount rather than serve ACLs it cannot enforce.
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        config
+            .add_capabilities(InitFlags::FUSE_POSIX_ACL | InitFlags::FUSE_DONT_MASK)
+            .map_err(|missing| {
+                std::io::Error::other(format!("the kernel's FUSE lacks {missing:?}"))
+            })
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.run(|state| block_on(state.lookup(parent, name))) {
             Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
@@ -144,11 +161,11 @@ impl Filesystem for Daemon {
             return reply.error(Errno::EPERM);
         }
         self.create_entry(
-            req,
             parent,
             name,
             Node::File,
-            permissions(mode, umask),
+            permissions(mode),
+            caller(req, umask),
             reply,
         );
     }
@@ -163,11 +180,11 @@ impl Filesystem for Daemon {
         reply: ReplyEntry,
     ) {
         self.create_entry(
-            req,
             parent,
             name,
             Node::Directory,
-            permissions(mode, umask),
+            permissions(mode),
+            caller(req, umask),
             reply,
         );
     }
@@ -181,11 +198,12 @@ impl Filesystem for Daemon {
         reply: ReplyEntry,
     ) {
         self.create_entry(
-            req,
             parent,
             link_name,
             Node::Symlink(target_bytes(target)),
             0o777,
+            // `posix_acl_create` leaves a symlink's mode alone.
+            caller(req, 0),
             reply,
         );
     }
@@ -200,11 +218,8 @@ impl Filesystem for Daemon {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let owner = Owner {
-            uid: req.uid(),
-            gid: req.gid(),
-        };
-        let permissions = permissions(mode, umask);
+        let owner = caller(req, umask);
+        let permissions = permissions(mode);
         match self.run(|state| {
             block_on(state.create(parent, name, Node::File, permissions, owner, now()))
         }) {
@@ -397,7 +412,6 @@ impl Filesystem for Daemon {
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         match self.run(|state| block_on(state.getxattr(ino, name, size))) {
             Ok((length, _)) if size == 0 => reply.size(length as u32),
-            Ok((length, _)) if length > size as usize => reply.error(Errno::ERANGE),
             Ok((_, value)) => reply.data(&value),
             Err(errno) => reply.error(errno),
         }
@@ -415,18 +429,25 @@ impl Filesystem for Daemon {
     fn setxattr(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        // Only macOS sets a position, in resource forks.
         _position: u32,
         reply: ReplyEmpty,
     ) {
-        reply.error(Errno::EOPNOTSUPP);
+        match self.run(|state| block_on(state.setxattr(ino, name, value, flags, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
-    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(Errno::EOPNOTSUPP);
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match self.run(|state| block_on(state.removexattr(ino, name, now()))) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
+        }
     }
 
     fn fallocate(
@@ -446,23 +467,27 @@ impl Filesystem for Daemon {
 impl Daemon {
     fn create_entry(
         &self,
-        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         node: Node<'_>,
         permissions: u32,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
-        let owner = Owner {
-            uid: req.uid(),
-            gid: req.gid(),
-        };
         match self
             .run(|state| block_on(state.create(parent, name, node, permissions, owner, now())))
         {
             Ok((attr, generation)) => reply.entry(&TTL, &attr, generation),
             Err(errno) => reply.error(errno),
         }
+    }
+}
+
+fn caller(req: &Request, umask: u32) -> Owner {
+    Owner {
+        uid: req.uid(),
+        gid: req.gid(),
+        umask,
     }
 }
 

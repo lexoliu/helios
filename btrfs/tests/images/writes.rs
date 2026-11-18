@@ -83,6 +83,7 @@ fn writer_commits_over_a_mkfs_image() {
                     permissions: 0o644,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -117,6 +118,7 @@ fn writer_commits_over_a_mkfs_image() {
                     permissions: 0o755,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -132,6 +134,7 @@ fn writer_commits_over_a_mkfs_image() {
                     permissions: 0o644,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -201,6 +204,7 @@ fn public_writer_preserves_snapshots_and_committed_handles() {
             permissions,
             uid: 1000,
             gid: 1000,
+            umask: 0,
         };
         let directory = tx
             .create_directory(
@@ -500,6 +504,7 @@ fn linux_authority_survives_unrelated_writes() {
                     permissions: 0o755,
                     uid: 0,
                     gid: 0,
+                    umask: 0,
                 },
                 when,
             )
@@ -513,6 +518,7 @@ fn linux_authority_survives_unrelated_writes() {
                         permissions: 0o644,
                         uid: 0,
                         gid: 0,
+                        umask: 0,
                     },
                     when,
                 )
@@ -565,6 +571,443 @@ fn assert_btrfs_check(shared: &Mutex<SparseImage>) {
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
+}
+
+/// Names that hash to one XATTR_ITEM key, found by search (CRC32C `0x4e84071b`).
+const COLLIDING: [&str; 2] = ["user.k1371838", "user.k2000402"];
+
+/// A version 2 `security.capability` value (revision, then four zero words).
+const CAPABILITY: [u8; 20] = [1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// Runs a tool and returns its standard output, failing the test when it
+/// fails.
+fn run(program: &str, args: &[&std::ffi::OsStr]) -> Vec<u8> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("running {program}: {error}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn os(text: &str) -> &std::ffi::OsStr {
+    std::ffi::OsStr::new(text)
+}
+
+/// A loop mount of an image, unmounted when dropped.
+struct Mounted(std::path::PathBuf);
+
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("sudo")
+            .arg("umount")
+            .arg(&self.0)
+            .status();
+    }
+}
+
+/// Every attribute `helios_btrfs` reads from `path`.
+fn helios_attributes<S: BlockSource>(
+    fs: &helios_btrfs::Filesystem<S>,
+    path: &str,
+) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    block_on(async {
+        let inode = fs.resolve(path.as_bytes()).await.unwrap();
+        let mut names = Vec::new();
+        fs.list_xattrs(&inode, |name| {
+            names.push(name.to_vec());
+            std::ops::ControlFlow::Continue(())
+        })
+        .await
+        .unwrap();
+        let mut found = std::collections::BTreeMap::new();
+        for name in names {
+            let mut value = vec![0; 70_000];
+            let length = fs.xattr(&inode, &name, &mut value).await.unwrap().unwrap();
+            value.truncate(length);
+            found.insert(name, value);
+        }
+        found
+    })
+}
+
+/// A version 2 `security.capability` granting `CAP_NET_RAW` (bit 13).
+const NET_RAW: [u8; 20] = [
+    1, 0, 0, 2, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// ACL entry tags (`include/uapi/linux/posix_acl.h`) and `ACL_UNDEFINED_ID`.
+const ACL_USER_OBJ: u16 = 0x01;
+const ACL_USER: u16 = 0x02;
+const ACL_GROUP_OBJ: u16 = 0x04;
+const ACL_GROUP: u16 = 0x08;
+const ACL_MASK: u16 = 0x10;
+const ACL_OTHER: u16 = 0x20;
+const NO_ID: u32 = u32::MAX;
+
+/// An ACL in the encoding `posix_acl_to_xattr` produces and `setfacl` hands
+/// to `setxattr(2)`.
+fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+    let mut bytes = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&perm.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes
+}
+
+/// `setfattr -v`'s hexadecimal form of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    let digits: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("0x{digits}")
+}
+
+/// Writes `image` out as an image file at `path`.
+fn save(image: &SparseImage, path: &std::path::Path) {
+    use std::io::Write;
+    let mut out = std::fs::File::create(path).unwrap();
+    let mut block = vec![0; 1 << 20];
+    let mut offset = 0;
+    let size = image.size_bytes();
+    while offset < size {
+        let length = block.len().min((size - offset) as usize);
+        image.read_bytes(offset, &mut block[..length]);
+        out.write_all(&block[..length]).unwrap();
+        offset += length as u64;
+    }
+}
+
+/// Loop-mounts the image file at `path` on a new directory beside it.
+fn loop_mount(path: &std::path::Path, options: &str) -> Mounted {
+    let mount = path.with_extension("mount");
+    std::fs::create_dir(&mount).unwrap();
+    run(
+        "sudo",
+        &[
+            os("mount"),
+            os("-o"),
+            os(&format!("loop,{options}")),
+            path.as_os_str(),
+            mount.as_os_str(),
+        ],
+    );
+    Mounted(mount)
+}
+
+/// The attributes Linux and Helios write, in every namespace Linux's btrfs
+/// stores, in both directions, and `btrfs check` over the result. Linux's
+/// own btrfs writes the `security.capability`, the `trusted.*` value and
+/// the ACLs, through the `setxattr(2)` path `setfacl` takes. Needs
+/// btrfs-progs, sudo (for `mount`, `umount` and the privileged namespaces)
+/// and `setfattr`/`getfattr` from the attr package.
+#[test]
+#[ignore = "needs btrfs-progs, sudo and attr; the Linux CI lane runs it with --run-ignored"]
+fn attributes_cross_between_linux_and_helios() {
+    use helios_btrfs::write::XattrMode;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    // `setfacl -m u:1000:rw-,g:1001:r--` on a 0644 file: the mask is the
+    // union of the group class, and the mode's group bits become the mask.
+    let linux_access = acl(&[
+        (ACL_USER_OBJ, 6, NO_ID),
+        (ACL_USER, 6, 1000),
+        (ACL_GROUP_OBJ, 4, NO_ID),
+        (ACL_GROUP, 4, 1001),
+        (ACL_MASK, 6, NO_ID),
+        (ACL_OTHER, 4, NO_ID),
+    ]);
+    // `setfacl -d -m u:1000:rwx` on a 0755 directory.
+    let linux_default = acl(&[
+        (ACL_USER_OBJ, 7, NO_ID),
+        (ACL_USER, 7, 1000),
+        (ACL_GROUP_OBJ, 5, NO_ID),
+        (ACL_MASK, 7, NO_ID),
+        (ACL_OTHER, 5, NO_ID),
+    ]);
+
+    // A directory on the build's own disk: tmpfs keeps no user.* attributes
+    // before Linux 6.6.
+    let source = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let file = source.path().join("file");
+    let directory = source.path().join("dir");
+    std::fs::write(&file, b"data").unwrap();
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::set_permissions(&file, PermissionsExt::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&directory, PermissionsExt::from_mode(0o755)).unwrap();
+    let setfattr = |path: &std::path::Path, name: &str, value: &str| {
+        run(
+            "setfattr",
+            &[os("-n"), os(name), os("-v"), os(value), path.as_os_str()],
+        );
+    };
+    setfattr(&file, "user.中文", "Linux 写的");
+    setfattr(&file, "user.한국어", "리눅스가 씀");
+    setfattr(&directory, "user.日本語", "Linux ディレクトリ");
+    let image = super::mkfs::mkfs_sized(source.path(), 128 << 20, &[]);
+
+    // Linux's btrfs writes the privileged namespaces and the ACLs.
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = scratch.path().join("image");
+    save(&image, &path);
+    {
+        let mounted = loop_mount(&path, "rw");
+        let sudo_setfattr = |relative: &str, name: &str, value: &str| {
+            run(
+                "sudo",
+                &[
+                    os("setfattr"),
+                    os("-n"),
+                    os(name),
+                    os("-v"),
+                    os(value),
+                    mounted.0.join(relative).as_os_str(),
+                ],
+            );
+        };
+        sudo_setfattr("file", "security.capability", &hex(&CAPABILITY));
+        sudo_setfattr("file", "trusted.中文", "Linux 信任的值");
+        sudo_setfattr("file", "system.posix_acl_access", &hex(&linux_access));
+        sudo_setfattr("dir", "system.posix_acl_default", &hex(&linux_default));
+    }
+    let image = super::mkfs::load_image(&path, 128 << 20);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(path.with_extension("mount")).unwrap();
+
+    // Helios reads what Linux wrote.
+    let linux = super::fixture::mount(image.clone()).expect("mounts");
+    assert_eq!(
+        helios_attributes(&linux, "/file"),
+        BTreeMap::from([
+            (
+                "user.中文".as_bytes().to_vec(),
+                "Linux 写的".as_bytes().to_vec()
+            ),
+            (
+                "user.한국어".as_bytes().to_vec(),
+                "리눅스가 씀".as_bytes().to_vec(),
+            ),
+            (b"security.capability".to_vec(), CAPABILITY.to_vec()),
+            (
+                "trusted.中文".as_bytes().to_vec(),
+                "Linux 信任的值".as_bytes().to_vec()
+            ),
+            (b"system.posix_acl_access".to_vec(), linux_access.clone()),
+        ])
+    );
+    assert_eq!(
+        helios_attributes(&linux, "/dir"),
+        BTreeMap::from([
+            (
+                "user.日本語".as_bytes().to_vec(),
+                "Linux ディレクトリ".as_bytes().to_vec()
+            ),
+            (b"system.posix_acl_default".to_vec(), linux_default.clone()),
+        ])
+    );
+    let linux_file = block_on(linux.resolve(b"/file")).unwrap();
+    assert_eq!(linux_file.metadata().permissions, 0o664);
+
+    // `u::rw-,u:1000:r--,g::r--,m::r--,o::---`, which makes the mode 0640.
+    let helios_access = acl(&[
+        (ACL_USER_OBJ, 6, NO_ID),
+        (ACL_USER, 4, 1000),
+        (ACL_GROUP_OBJ, 4, NO_ID),
+        (ACL_MASK, 4, NO_ID),
+        (ACL_OTHER, 0, NO_ID),
+    ]);
+    let helios_default = acl(&[
+        (ACL_USER_OBJ, 7, NO_ID),
+        (ACL_GROUP_OBJ, 5, NO_ID),
+        (ACL_GROUP, 7, 1001),
+        (ACL_MASK, 7, NO_ID),
+        (ACL_OTHER, 0, NO_ID),
+    ]);
+
+    // Helios replaces, creates and removes beside them.
+    let shared = std::sync::Arc::new(WritableImage(Mutex::new(image)));
+    let when = Timestamp {
+        seconds: 1_700_000_100,
+        nanoseconds: 0,
+    };
+    block_on(async {
+        let mut writer = Writer::mount(
+            SharedImage(shared.clone()),
+            no_uuid as fn() -> [u8; 16],
+            std::thread::available_parallelism().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        let file = tx.lookup(&root, b"file").await.unwrap().unwrap();
+        let directory = tx.lookup(&root, b"dir").await.unwrap().unwrap();
+        tx.set_xattr(
+            &file,
+            "user.中文".as_bytes(),
+            "Helios が書いた".as_bytes(),
+            XattrMode::Replace,
+            when,
+        )
+        .await
+        .unwrap();
+        tx.set_xattr(
+            &file,
+            "user.日本語".as_bytes(),
+            "ヘリオス".as_bytes(),
+            XattrMode::Create,
+            when,
+        )
+        .await
+        .unwrap();
+        for (index, name) in COLLIDING.iter().enumerate() {
+            tx.set_xattr(
+                &file,
+                name.as_bytes(),
+                format!("collision {index}").as_bytes(),
+                XattrMode::Create,
+                when,
+            )
+            .await
+            .unwrap();
+        }
+        tx.remove_xattr(&file, "user.한국어".as_bytes(), when)
+            .await
+            .unwrap();
+        tx.set_xattr(
+            &directory,
+            "user.目录".as_bytes(),
+            "헬리오스".as_bytes(),
+            XattrMode::Set,
+            when,
+        )
+        .await
+        .unwrap();
+        // Every namespace Linux's btrfs stores is Helios's to write too.
+        tx.set_xattr(
+            &file,
+            b"security.capability",
+            &NET_RAW,
+            XattrMode::Replace,
+            when,
+        )
+        .await
+        .unwrap();
+        tx.set_xattr(
+            &file,
+            "trusted.日本語".as_bytes(),
+            "ヘリオスの信頼".as_bytes(),
+            XattrMode::Create,
+            when,
+        )
+        .await
+        .unwrap();
+        tx.remove_xattr(&file, "trusted.中文".as_bytes(), when)
+            .await
+            .unwrap();
+        tx.set_xattr(
+            &file,
+            b"system.posix_acl_access",
+            &helios_access,
+            XattrMode::Set,
+            when,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tx.metadata(&file).await.unwrap().permissions, 0o640);
+        tx.set_xattr(
+            &directory,
+            b"system.posix_acl_default",
+            &helios_default,
+            XattrMode::Set,
+            when,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    });
+    let expected_file = BTreeMap::from([
+        (
+            "user.中文".to_string(),
+            "Helios が書いた".as_bytes().to_vec(),
+        ),
+        ("user.日本語".to_string(), "ヘリオス".as_bytes().to_vec()),
+        (COLLIDING[0].to_string(), b"collision 0".to_vec()),
+        (COLLIDING[1].to_string(), b"collision 1".to_vec()),
+        ("security.capability".to_string(), NET_RAW.to_vec()),
+        (
+            "trusted.日本語".to_string(),
+            "ヘリオスの信頼".as_bytes().to_vec(),
+        ),
+        ("system.posix_acl_access".to_string(), helios_access),
+    ]);
+    let expected_directory = BTreeMap::from([
+        (
+            "user.日本語".to_string(),
+            "Linux ディレクトリ".as_bytes().to_vec(),
+        ),
+        ("user.目录".to_string(), "헬리오스".as_bytes().to_vec()),
+        ("system.posix_acl_default".to_string(), helios_default),
+    ]);
+
+    // Write the image out for Linux.
+    save(&shared.0.lock().unwrap(), &path);
+    run("btrfs", &[os("check"), os("--readonly"), path.as_os_str()]);
+
+    // Linux mounts it and reads what Helios wrote.
+    let mounted = loop_mount(&path, "ro");
+    let mode = std::fs::metadata(mounted.0.join("file"))
+        .unwrap()
+        .permissions();
+    assert_eq!(mode.mode() & 0o7777, 0o640);
+    for (relative, expected) in [("file", &expected_file), ("dir", &expected_directory)] {
+        let target = mounted.0.join(relative);
+        for (name, value) in expected {
+            let found = run(
+                "sudo",
+                &[
+                    os("getfattr"),
+                    os("--only-values"),
+                    os("--absolute-names"),
+                    os("-n"),
+                    os(name),
+                    target.as_os_str(),
+                ],
+            );
+            assert_eq!(&found, value, "{relative} {name}");
+        }
+        let listing = run(
+            "sudo",
+            &[
+                os("getfattr"),
+                os("-d"),
+                os("-m"),
+                os("-"),
+                os("-e"),
+                os("hex"),
+                os("--absolute-names"),
+                target.as_os_str(),
+            ],
+        );
+        let listed = String::from_utf8_lossy(&listing)
+            .lines()
+            .filter(|line| !line.starts_with('#') && line.contains('='))
+            .count();
+        assert_eq!(listed, expected.len(), "{relative}: {listing:?}");
+    }
+    // The attribute Helios removed is gone for Linux too.
+    let removed = std::process::Command::new("sudo")
+        .args(["getfattr", "--absolute-names", "-n", "user.한국어"])
+        .arg(mounted.0.join("file"))
+        .output()
+        .unwrap();
+    assert!(!removed.status.success());
 }
 
 fn inline_text(length: usize) -> Vec<u8> {
@@ -634,6 +1077,7 @@ fn exercise_inline_limits(image: SparseImage) -> std::sync::Arc<WritableImage> {
             permissions: 0o644,
             uid: 1000,
             gid: 1000,
+            umask: 0,
         };
 
         // Write paths: uncompressed & compressed, at and across limits.
@@ -649,6 +1093,7 @@ fn exercise_inline_limits(image: SparseImage) -> std::sync::Arc<WritableImage> {
                     permissions: 0o755,
                     uid: 1000,
                     gid: 1000,
+                    umask: 0,
                 },
                 WHEN,
             )

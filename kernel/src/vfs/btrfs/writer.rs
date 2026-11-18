@@ -489,6 +489,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                                 permissions: 0o644,
                                 uid: 0,
                                 gid: 0,
+                                umask: 0,
                             },
                             when,
                         )
@@ -525,6 +526,7 @@ async fn apply<S: BlockSink, U: RootUuids>(
                 permissions: 0o755,
                 uid: 0,
                 gid: 0,
+                umask: 0,
             };
             match operation {
                 Operation::Symlink { target } => {

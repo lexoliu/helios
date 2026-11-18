@@ -1,21 +1,10 @@
+generic/020 # _attr_get_maxval_size hardcodes a 65536-byte xattr value for FSTYP=fuse, exceeding BTRFS_MAX_XATTR_SIZE
+generic/108 # #1085: overwrites SCRATCH_DEV with LVM pvcreate while FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
 generic/128 # #1037: chmod 4755 on a file, setuid is refused
 generic/193 # #1037: chmod ug+s on files and the set-id bits chown clears, setuid is refused
+generic/338 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_SUBTYP
 generic/355 # #1037: chmod ug+s on a file, setuid is refused
 generic/375 # #1037: chmod 2755 on a file, setgid is refused
-generic/513 # #1037: setcap on a file, security.capability is refused
-generic/673 # #1037: chmod a+rws on a file, setuid is refused
-generic/674 # #1037: chmod a+rws on a file, setuid is refused
-generic/675 # #1037: setcap on a file, security.capability is refused
-generic/683 # #1037: chmod a+rws on a file, setuid is refused
-generic/684 # #1037: chmod a+rws on a file, setuid is refused
-generic/685 # #1037: chmod a+rws on a file, setuid is refused
-generic/686 # #1037: chmod a+rws on a file, setuid is refused
-generic/687 # #1037: chmod a+rws on a file, setuid is refused
-generic/688 # #1037: setcap on a file, security.capability is refused
-generic/726 # #1037: chmod a+rws on a file, setuid is refused
-generic/727 # #1037: setcap on a file, security.capability is refused
-generic/108 # #1085: overwrites SCRATCH_DEV with LVM pvcreate while FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
-generic/338 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_SUBTYP
 generic/409 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP
 generic/410 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP
 generic/411 # #1085: _get_mount passes -t fuse without FUSE_SUBTYP
@@ -24,7 +13,17 @@ generic/484 # #1085: common/dmerror _dmerror_mount passes -t fuse without FUSE_S
 generic/563 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
 generic/604 # #1085: races mount against background umount while O_EXCL holds the device until unmount finishes
 generic/620 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/633 # #1037: vfstest setattr_truncate creates a file with S_ISUID; writer refuses setuid on non-directory creation
+generic/673 # #1037: chmod a+rws on a file, setuid is refused
+generic/674 # #1037: chmod a+rws on a file, setuid is refused
+generic/683 # #1037: chmod a+rws on a file, setuid is refused
+generic/684 # #1037: chmod a+rws on a file, setuid is refused
+generic/685 # #1037: chmod a+rws on a file, setuid is refused
+generic/686 # #1037: chmod a+rws on a file, setuid is refused
+generic/687 # #1037: chmod a+rws on a file, setuid is refused
+generic/697 # fuse-btrfs mknod returns EPERM for non-regular files; vfstest setgid_create_acl calls mknodat for device nodes
 generic/704 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
+generic/726 # #1037: chmod a+rws on a file, setuid is refused
 generic/731 # #1085: FSTYP=fuse _mkfs_dev is a no-op and bare _mount omits FUSE_SUBTYP
 generic/732 # #1085: mounts SCRATCH_DEV on two mountpoints at once while fuse-btrfs claims the device O_EXCL
 generic/740 # #1085: formats SCRATCH_DEV with other filesystems while mkfs.fuse does not exist to restore btrfs

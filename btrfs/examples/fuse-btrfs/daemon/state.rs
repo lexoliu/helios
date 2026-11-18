@@ -18,6 +18,7 @@ use fuser::{Errno, FileAttr, FileType, Generation, INodeNo, TimeOrNow};
 use futures_lite::future::block_on;
 use helios_btrfs::write::{
     Attributes, DEFAULT_DIRTY_METADATA_LIMIT, InodeHandle, Name, RootUuids, WriteOptions, Writer,
+    XattrMode,
 };
 use helios_btrfs::{
     DirPosition, EntryTarget, Error, FileKind, Filesystem, Inode, Metadata, Timestamp,
@@ -67,6 +68,9 @@ pub enum Node<'a> {
 pub struct Owner {
     pub uid: u32,
     pub gid: u32,
+    /// The caller's umask, which the writer applies as `posix_acl_create`
+    /// does.
+    pub umask: u32,
 }
 
 pub struct Statfs {
@@ -427,6 +431,7 @@ impl State {
             permissions,
             uid: owner.uid,
             gid: owner.gid,
+            umask: owner.umask,
         };
         let created = match node {
             Node::File => transaction.create_file(at, attributes, now).await,
@@ -569,24 +574,79 @@ impl State {
         })
     }
 
-    /// The value of extended attribute `name`; its full length even when
-    /// `size` is too small to hold it, and nothing when `size` is zero.
+    /// `getxattr(2)`: the attribute's length when `size` is zero, or its
+    /// bytes when `size` holds them (`ERANGE` when `size` is too small).
     pub async fn getxattr(
-        &self,
+        &mut self,
         ino: INodeNo,
         name: &OsStr,
         size: u32,
     ) -> Result<(usize, Vec<u8>), Errno> {
-        let snapshot = self.snapshot()?;
-        let inode = self.open_inode(&snapshot, ino).await?;
-        let mut value = vec![0; size as usize];
-        let length = snapshot
-            .xattr(&inode, name.as_bytes(), &mut value)
+        // Linux's FUSE client (`fs/fuse/xattr.c` in torvalds/linux) uses a
+        // catch-all `.prefix = ""` handler, so non-ACL `getxattr` requests
+        // reach the daemon for namespace and bare-prefix validation.
+        let file = self.inodes.handle(ino)?;
+        let transaction = self
+            .writer
+            .join()
             .await
-            .map_err(|error| read_errno(&error))?
-            .ok_or(Errno::NO_XATTR)?;
+            .map_err(|error| write_errno(&error))?;
+        let mut value = vec![0; size as usize];
+        let length = transaction
+            .xattr(&file, name.as_bytes(), &mut value)
+            .await
+            .map_err(|error| write_errno(&error))?;
         value.truncate(length.min(value.len()));
         Ok((length, value))
+    }
+
+    /// `setxattr(2)`: `flags` is `XATTR_CREATE` or `XATTR_REPLACE` or neither.
+    pub async fn setxattr(
+        &mut self,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        now: Timestamp,
+    ) -> Result<(), Errno> {
+        let mode = match flags {
+            0 => XattrMode::Set,
+            libc::XATTR_CREATE => XattrMode::Create,
+            libc::XATTR_REPLACE => XattrMode::Replace,
+            _ => return Err(Errno::EINVAL),
+        };
+        self.writable()?;
+        let file = self.inodes.handle(ino)?;
+        let mut transaction = self
+            .writer
+            .join()
+            .await
+            .map_err(|error| write_errno(&error))?;
+        transaction
+            .set_xattr(&file, name.as_bytes(), value, mode, now)
+            .await
+            .map_err(|error| write_errno(&error))?;
+        self.settle().await
+    }
+
+    pub async fn removexattr(
+        &mut self,
+        ino: INodeNo,
+        name: &OsStr,
+        now: Timestamp,
+    ) -> Result<(), Errno> {
+        self.writable()?;
+        let file = self.inodes.handle(ino)?;
+        let mut transaction = self
+            .writer
+            .join()
+            .await
+            .map_err(|error| write_errno(&error))?;
+        transaction
+            .remove_xattr(&file, name.as_bytes(), now)
+            .await
+            .map_err(|error| write_errno(&error))?;
+        self.settle().await
     }
 
     /// The names of the extended attributes, each followed by a NUL.

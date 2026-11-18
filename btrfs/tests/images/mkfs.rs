@@ -64,9 +64,13 @@ pub(crate) fn mkfs_sized(root: &Path, bytes: u64, args: &[&str]) -> SparseImage 
         "mkfs.btrfs {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    load_image(&path, bytes)
+}
 
+/// The `bytes`-long image file at `path`, holding only its nonzero blocks.
+pub(crate) fn load_image(path: &Path, bytes: u64) -> SparseImage {
     let mut image = SparseImage::new(bytes);
-    let mut file = fs::File::open(&path).unwrap();
+    let mut file = fs::File::open(path).unwrap();
     let mut block = vec![0; 1 << 16];
     let mut offset = 0;
     loop {

@@ -42,6 +42,7 @@ pub use crate::fs::writer::{
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;
 pub use crate::transaction::file::{DEFAULT_MAX_INLINE, WriteOptions};
+pub use crate::transaction::xattr::XattrMode;
 pub use crate::tree::edit::EditError;
 pub use crate::tree::write::WriteError;
 pub use crate::uuid_tree::UuidDefect;
