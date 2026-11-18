@@ -28,6 +28,8 @@ pub(crate) struct Attributes {
     pub(crate) mode: u32,
     pub(crate) uid: u32,
     pub(crate) gid: u32,
+    /// The inode item's `rdev`: a device node's number, zero otherwise.
+    pub(crate) rdev: u64,
 }
 
 fn validate_name(name: &[u8]) -> Result<(), WriteError> {
@@ -157,7 +159,6 @@ impl<S: BlockSink> Transaction<S> {
         when: Timestamp,
     ) -> Result<u64, WriteError> {
         validate_name(name.bytes)?;
-        super::ownership::refuse_set_id(attributes.mode)?;
         let tree = name.tree;
         let next = if let Some(last) = self.inode_high_water.get(&tree) {
             last.checked_add(1)
@@ -186,6 +187,7 @@ impl<S: BlockSink> Transaction<S> {
         raw.mode.set(attributes.mode);
         raw.uid.set(attributes.uid);
         raw.gid.set(attributes.gid);
+        raw.rdev.set(attributes.rdev);
         raw.atime = timestamp;
         raw.ctime = timestamp;
         raw.mtime = timestamp;

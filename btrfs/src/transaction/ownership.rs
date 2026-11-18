@@ -1,6 +1,7 @@
-//! Changing an inode's permission bits and its owner. Neither operation ever
-//! lets a file carry set-id authority: a non-directory refuses S_ISUID and
-//! S_ISGID, and a change of owner removes them (lexoliu/helios#1037).
+//! Changing an inode's permission bits and its owner, stored as Linux's
+//! btrfs stores them. The set-id and sticky bits are kept on every kind of
+//! inode: what they mean is decided by the mount a caller reaches the
+//! filesystem through, never by the storage (lexoliu/helios#1037).
 
 use super::Transaction;
 use super::namespace::{check_flags, time};
@@ -9,30 +10,17 @@ use crate::source::BlockSink;
 use crate::tree::write::WriteError;
 use crate::{FileKind, Timestamp};
 
-/// The file type bits of an inode's mode.
-pub(crate) const S_IFMT: u32 = 0o170_000;
-pub(crate) const S_IFDIR: u32 = 0o040_000;
 /// Every bit `chmod` sets: permissions, sticky and the two set-id bits.
-pub(crate) const S_IALLUGO: u32 = 0o7777;
-pub(crate) const S_ISUID: u32 = 0o4000;
-pub(crate) const S_ISGID: u32 = 0o2000;
-
-/// Refuses a mode that gives a non-directory the set-id authority. S_ISGID on
-/// a directory makes new entries inherit its group and is legitimate;
-/// S_ISUID on a directory has no meaning and is left alone.
-pub(crate) fn refuse_set_id(mode: u32) -> Result<(), WriteError> {
-    if mode & S_IFMT != S_IFDIR && mode & (S_ISUID | S_ISGID) != 0 {
-        return Err(WriteError::SetId {
-            permissions: mode & S_IALLUGO,
-        });
-    }
-    Ok(())
-}
+const S_IALLUGO: u32 = 0o7777;
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
 
 impl<S: BlockSink> Transaction<S> {
     /// Replaces the permission bits, keeping the file type, as `chmod`
     /// (`chmod_common` in `fs/open.c` stores `(mode & S_IALLUGO) |
-    /// (inode->i_mode & ~S_IALLUGO)`).
+    /// (inode->i_mode & ~S_IALLUGO)`). The set-id bits are stored on a
+    /// non-directory as on a directory, as `btrfs_setattr` stores whatever
+    /// `notify_change` hands it.
     pub(crate) async fn set_permissions(
         &mut self,
         tree: u64,
@@ -46,7 +34,6 @@ impl<S: BlockSink> Transaction<S> {
         let (mut raw, metadata) = self.inode_item(tree, inode).await?;
         check_flags(tree, inode, metadata.flags, INODE_IMMUTABLE | INODE_APPEND)?;
         let mode = (raw.mode.get() & !S_IALLUGO) | permissions;
-        refuse_set_id(mode)?;
         let changed = time(tree, inode, changed)?;
         raw.mode.set(mode);
         raw.ctime = changed;

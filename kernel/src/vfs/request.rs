@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use super::{
     BtrfsFs, BtrfsService, BtrfsWriteOptions, ErofsError, ErofsFs, HostShare, MemoryFs, MountError,
-    MountedFs, Namespace, Storage,
+    MountGrant, MountSharing, MountedFs, Namespace, Storage,
 };
 use crate::{BlockCache, ProcessAuthority, ProcessAuthorityError};
 
@@ -75,18 +75,37 @@ pub enum MountRequestError {
     Mount(#[from] MountError),
 }
 
-/// Attaches the filesystem `source` names at `point`, under `authority`,
-/// from the storage the machine `attached`. The caller must spawn any returned
+/// One mount user space asks for.
+pub struct MountRequest<'a> {
+    pub source: MountSource,
+    /// The guest path to attach the filesystem at.
+    pub point: &'a str,
+    /// Attach for reading only. The boot image and an EROFS disk are
+    /// read-only whatever this says.
+    pub read_only: bool,
+    /// Whether the mount is private or shared, for as long as it exists.
+    pub sharing: MountSharing,
+    /// How a writable btrfs mount writes; only btrfs takes a compression
+    /// policy or a commit interval.
+    pub write: BtrfsWriteOptions,
+}
+
+/// Attaches the filesystem `request` names, under `authority`, from the
+/// storage the machine `attached`. The caller must spawn any returned
 /// service on the kernel executor before serving filesystem requests.
 pub async fn request_mount<S: Storage>(
     authority: &ProcessAuthority,
     namespace: &Namespace<S>,
     attached: AttachedStorage<S>,
-    source: MountSource,
-    point: &str,
-    read_only: bool,
-    write: BtrfsWriteOptions,
+    request: MountRequest<'_>,
 ) -> Result<Option<BtrfsService<S::Disk>>, MountRequestError> {
+    let MountRequest {
+        source,
+        point,
+        read_only,
+        sharing,
+        write,
+    } = request;
     let cap = authority.derive_mount_cap(point)?;
     if write.compress.is_some() && !matches!(source, MountSource::Btrfs { .. }) {
         return Err(MountRequestError::CompressionUnsupported);
@@ -147,7 +166,9 @@ pub async fn request_mount<S: Storage>(
             FileSystemRights::READ | FileSystemRights::WRITE
         }
     };
-    namespace.mount(&cap, fs, rights).await?;
+    namespace
+        .mount(&cap, fs, MountGrant { rights, sharing })
+        .await?;
     Ok(service)
 }
 

@@ -8,8 +8,6 @@
 //! lacks the feature, and nothing else:
 //!
 //! - `setattr` changing the file flags: `EOPNOTSUPP`
-//! - `setattr` or a creation giving a non-directory S_ISUID or S_ISGID: `EPERM`
-//! - `mknod` of anything but a regular file: `EPERM`
 //! - `setxattr`, `removexattr`, `fallocate`: `EOPNOTSUPP`
 //! - `rename` with `RENAME_WHITEOUT`, or with both `RENAME_NOREPLACE` and
 //!   `RENAME_EXCHANGE`: `EINVAL`
@@ -27,7 +25,8 @@ use fuser::{
     ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use futures_lite::future::block_on;
-use helios_btrfs::Timestamp;
+use helios_btrfs::write::Special;
+use helios_btrfs::{DeviceNumber, Timestamp};
 use helios_hal::fs::RenameMode;
 
 use super::state::{Node, Owner, Setattr, State, target_bytes, timestamp};
@@ -137,20 +136,23 @@ impl Filesystem for Daemon {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _rdev: u32,
+        rdev: u32,
         reply: ReplyEntry,
     ) {
-        if mode & libc::S_IFMT != libc::S_IFREG {
-            return reply.error(Errno::EPERM);
-        }
-        self.create_entry(
-            req,
-            parent,
-            name,
-            Node::File,
-            permissions(mode, umask),
-            reply,
-        );
+        // The kernel sends `mknod`'s own encoding of the number
+        // (`fuse_mknod` in `fs/fuse/dir.c` applies `new_encode_dev`).
+        let device = DeviceNumber::decode(rdev);
+        let node = match mode & libc::S_IFMT {
+            libc::S_IFREG => Node::File,
+            libc::S_IFCHR => Node::Special(Special::CharDevice(device)),
+            libc::S_IFBLK => Node::Special(Special::BlockDevice(device)),
+            libc::S_IFIFO => Node::Special(Special::Fifo),
+            libc::S_IFSOCK => Node::Special(Special::Socket),
+            // `vfs_mknod` refuses every other type before it reaches a
+            // filesystem.
+            _ => return reply.error(Errno::EINVAL),
+        };
+        self.create_entry(req, parent, name, node, permissions(mode, umask), reply);
     }
 
     fn mkdir(

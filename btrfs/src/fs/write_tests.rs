@@ -698,6 +698,7 @@ async fn exercise_namespace_rename(mut verify: impl FnMut(&std::path::Path)) {
         mode,
         uid: 1000,
         gid: 1000,
+        rdev: 0,
     };
     let mut tx = writer.join().await.unwrap();
     let edits = tx.edits();
@@ -886,6 +887,7 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
                     mode: 0o040755,
                     uid: 1000,
                     gid: 1000,
+                    rdev: 0,
                 },
                 when,
             )
@@ -905,6 +907,7 @@ async fn exercise_namespace_links(mut verify: impl FnMut(&std::path::Path)) {
                 mode: 0o100640,
                 uid: 1000,
                 gid: 1000,
+                rdev: 0,
             },
             when,
         )
@@ -6871,7 +6874,7 @@ const CJK_NAMES: [&str; 4] = ["plain", "中文文件", "日本語のファイル
 
 #[cfg(feature = "write")]
 #[test]
-fn chmod_and_chown_update_the_inode_and_refuse_set_id_on_files() {
+fn chmod_and_chown_update_the_inode_and_store_set_id_as_linux_does() {
     block_on(exercise_mode_and_owner(|_| {}));
 }
 
@@ -6890,8 +6893,7 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
     let stamp = Timestamp::from_secs(1_700_000_000);
     // Owned by root, as `Metadata::new` makes it.
     let image = |mode: u16| Metadata::new(mode, stamp);
-    // Set-id bits as a Linux-made image carries them: the writer cannot
-    // create these, so ferrosys lays them out.
+    // Set-id bits as a Linux-made image carries them, laid out by ferrosys.
     let mut tree = TreeBuilder::new().root(Metadata::new(0o755, stamp));
     for name in CJK_NAMES {
         tree = tree
@@ -7003,52 +7005,53 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
         assert_eq!((metadata.uid, metadata.gid), (1000, 1000), "{name}");
         assert_eq!(metadata.ctime, when, "{name}");
 
-        // The refusals leave the inode and the transaction as they were.
-        let settled = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
-        for bits in [0o4755, 0o2755, 0o6755, 0o4000, 0o2000] {
-            assert!(
-                matches!(
-                    tx.set_permissions(&file, bits, when).await,
-                    Err(WriteError::SetId { permissions }) if permissions == bits
-                ),
+        // chmod stores the set-id bits on a file as Linux's btrfs does; what
+        // they mean is the mount's to decide.
+        for bits in [0o4755, 0o2755, 0o6755, 0o4000, 0o2000, 0o2644, 0o7777] {
+            tx.set_permissions(&file, bits, when).await.unwrap();
+            assert_eq!(
+                tx.metadata(&file).await.unwrap().permissions,
+                bits,
                 "{name} {bits:#o}"
             );
         }
+        // A file type in the permission bits is still refused, and leaves
+        // the inode as it was.
+        let settled = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
         assert!(matches!(
             tx.set_permissions(&file, 0o100_644, when).await,
             Err(WriteError::InvalidPermissions { .. })
         ));
         let unchanged = tx.edits().inode_item(tree, file.number()).await.unwrap().0;
         assert_eq!(settled.as_bytes(), unchanged.as_bytes(), "{name}");
-        let setuid = |permissions| Attributes {
+        tx.set_permissions(&file, 0o600, when).await.unwrap();
+        let attributes = |permissions| Attributes {
             permissions,
             uid: 0,
             gid: 0,
         };
-        assert!(matches!(
-            tx.create_file(at!(format!("new-{name}")), setuid(0o4755), when)
-                .await,
-            Err(WriteError::SetId { .. })
-        ));
-        assert!(matches!(
-            tx.create_file(at!(format!("new-{name}")), setuid(0o2755), when)
-                .await,
-            Err(WriteError::SetId { .. })
-        ));
-        assert!(matches!(
-            tx.symlink(at!(format!("new-{name}")), b"target", setuid(0o2777), when)
-                .await,
-            Err(WriteError::SetId { .. })
-        ));
-        assert!(
-            tx.lookup(&root, format!("new-{name}").as_bytes())
+        // A creation stores them too, on every kind.
+        for (prefix, bits) in [("suid", 0o4755), ("sgid", 0o2755), ("both", 0o6711)] {
+            let created = tx
+                .create_file(at!(format!("new-{prefix}-{name}")), attributes(bits), when)
                 .await
-                .unwrap()
-                .is_none()
-        );
-        // A directory takes S_ISGID, and its S_ISUID means nothing.
+                .unwrap();
+            let metadata = tx.metadata(&created).await.unwrap();
+            assert_eq!(metadata.kind, crate::FileKind::Regular, "{name}");
+            assert_eq!(metadata.permissions, bits, "{name} {bits:#o}");
+        }
+        let link = tx
+            .symlink(
+                at!(format!("link-{name}")),
+                b"target",
+                attributes(0o2777),
+                when,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx.metadata(&link).await.unwrap().permissions, 0o2777);
         let directory = tx
-            .create_directory(at!(format!("new-{name}")), setuid(0o2755), when)
+            .create_directory(at!(format!("new-{name}")), attributes(0o2755), when)
             .await
             .unwrap();
         assert_eq!(tx.metadata(&directory).await.unwrap().permissions, 0o2755);
@@ -7073,6 +7076,11 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
         let file = read(format!("/{name}")).await;
         assert_eq!((file.permissions, file.uid, file.gid), (0o600, 1000, 1000));
         assert_eq!(file.kind, crate::FileKind::Regular);
+        for (prefix, bits) in [("suid", 0o4755), ("sgid", 0o2755), ("both", 0o6711)] {
+            let created = read(format!("/new-{prefix}-{name}")).await;
+            assert_eq!(created.permissions, bits, "{name} {bits:#o}");
+        }
+        assert_eq!(read(format!("/new-{name}")).await.permissions, 0o4755);
     }
     // The base view still shows the image as it was made.
     let original = *base
@@ -7083,6 +7091,156 @@ async fn exercise_mode_and_owner(mut verify: impl FnMut(&std::path::Path)) {
     assert_eq!((original.permissions, original.uid), (0o4755, 0));
     drop((base, current, writer));
     verify(named.path());
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn special_nodes_are_created_kept_and_removed_as_mknod_makes_them() {
+    block_on(exercise_special_nodes(|_| {}));
+}
+
+#[cfg(feature = "write")]
+#[test]
+#[ignore = "needs btrfs-progs; the Linux CI lane runs it with --run-ignored"]
+fn special_nodes_pass_btrfs_check() {
+    block_on(exercise_special_nodes(assert_btrfs_check));
+}
+
+#[cfg(feature = "write")]
+async fn exercise_special_nodes(mut verify: impl FnMut(&std::path::Path)) {
+    use super::writer::{Attributes, Name, Special};
+    use crate::{DeviceNumber, FileKind};
+    use alloc::format;
+    let stamp = Timestamp::from_secs(1_700_000_000);
+    let named = tempfile::NamedTempFile::new().unwrap();
+    drop(filesystem_image_tree_file(
+        true,
+        true,
+        TreeBuilder::new().root(Metadata::new(0o755, stamp)),
+        named.reopen().unwrap(),
+    ));
+    let mut writer = mount_writer(Disk(named.reopen().unwrap())).await.unwrap();
+    let when = stamp_of(1_700_000_100);
+    // /dev/null, /dev/sda and a number wide enough to use the minor's high
+    // bits, which `stat` and the inode item encode differently.
+    let null = DeviceNumber::new(1, 3).unwrap();
+    let disk = DeviceNumber::new(8, 0).unwrap();
+    let wide = DeviceNumber::new(4095, 0xf_ffff).unwrap();
+    assert!(DeviceNumber::new(4096, 0).is_none());
+    assert!(DeviceNumber::new(0, 1 << 20).is_none());
+    let kinds = [
+        ("chr", Special::CharDevice(null), FileKind::CharDevice, null),
+        (
+            "blk",
+            Special::BlockDevice(disk),
+            FileKind::BlockDevice,
+            disk,
+        ),
+        (
+            "wide",
+            Special::CharDevice(wide),
+            FileKind::CharDevice,
+            wide,
+        ),
+        (
+            "fifo",
+            Special::Fifo,
+            FileKind::Fifo,
+            DeviceNumber::default(),
+        ),
+        (
+            "sock",
+            Special::Socket,
+            FileKind::Socket,
+            DeviceNumber::default(),
+        ),
+    ];
+    let mut tx = writer.join().await.unwrap();
+    let root = tx.root().await.unwrap();
+    for name in CJK_NAMES {
+        for (prefix, special, kind, device) in kinds {
+            let node = tx
+                .create_special(
+                    Name {
+                        parent: &root,
+                        bytes: format!("{prefix}-{name}").as_bytes(),
+                    },
+                    special,
+                    Attributes {
+                        permissions: 0o6640,
+                        uid: 1000,
+                        gid: 6,
+                    },
+                    when,
+                )
+                .await
+                .unwrap();
+            let metadata = tx.metadata(&node).await.unwrap();
+            assert_eq!(metadata.kind, kind, "{prefix}-{name}");
+            assert_eq!(metadata.rdev, device, "{prefix}-{name}");
+            assert_eq!(metadata.permissions, 0o6640, "{prefix}-{name}");
+            assert_eq!((metadata.uid, metadata.gid), (1000, 6), "{prefix}-{name}");
+            assert_eq!((metadata.size, metadata.nbytes), (0, 0), "{prefix}-{name}");
+        }
+    }
+    tx.commit().await.unwrap();
+
+    // Unrelated changes leave the nodes as they were made, and a removal
+    // takes one away.
+    let mut tx = writer.join().await.unwrap();
+    let root = tx.root().await.unwrap();
+    for name in CJK_NAMES {
+        let chr = tx.lookup(&root, format!("chr-{name}").as_bytes()).await;
+        let chr = chr.unwrap().unwrap();
+        tx.set_owner(&chr, Some(0), Some(0), when).await.unwrap();
+        // chown drops the set-id bits of a non-directory.
+        assert_eq!(tx.metadata(&chr).await.unwrap().permissions, 0o640);
+        assert_eq!(tx.metadata(&chr).await.unwrap().rdev, null);
+        tx.unlink_name(
+            Name {
+                parent: &root,
+                bytes: format!("sock-{name}").as_bytes(),
+            },
+            when,
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let view = writer.snapshot().unwrap();
+    for name in CJK_NAMES {
+        for (prefix, _, kind, device) in kinds {
+            let path = format!("/{prefix}-{name}");
+            let resolved = view.resolve(path.as_bytes()).await;
+            if prefix == "sock" {
+                assert!(resolved.is_err(), "{path}");
+                continue;
+            }
+            let metadata = *resolved.unwrap().metadata();
+            assert_eq!((metadata.kind, metadata.rdev), (kind, device), "{path}");
+        }
+    }
+    drop((view, writer));
+    verify(named.path());
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn device_numbers_encode_as_linux_encodes_them() {
+    use crate::DeviceNumber;
+    // `new_encode_dev` and `MKDEV` in include/linux/kdev_t.h.
+    for (major, minor, encoded, inode) in [
+        (1, 3, 0x103, (1 << 20) | 3),
+        (8, 0, 0x800, 8 << 20),
+        (259, 0x1_2345, 0x1231_0345, (259 << 20) | 0x1_2345),
+        (4095, 0xf_ffff, 0xffff_ffff, u32::MAX),
+    ] {
+        let number = DeviceNumber::new(major, minor).unwrap();
+        assert_eq!(number.encode(), encoded, "{major}:{minor}");
+        assert_eq!(DeviceNumber::decode(encoded), number, "{major}:{minor}");
+        assert_eq!(number.inode_item(), u64::from(inode), "{major}:{minor}");
+        assert_eq!(DeviceNumber::from_inode_item(u64::from(inode)), number);
+    }
 }
 
 #[cfg(feature = "write")]

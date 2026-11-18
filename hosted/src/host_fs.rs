@@ -2,14 +2,14 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{self as unix_fs, FileExt, FileTypeExt, MetadataExt};
+use std::os::unix::fs::{self as unix_fs, FileExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use helios_hal::fs::{Landed, NodeKind, WritePosition, WriteProgress};
 use helios_hal::io::IoError;
 use helios_kernel::{
-    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
-    HostMetadata, HostWrite, ObjectIdentity,
+    AuthorityDomain, HostCreation, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite,
+    HostFsError, HostMetadata, HostWrite, ObjectIdentity,
 };
 
 /// Linux `ENOSPC`, the code a host-share server answers a full device with.
@@ -196,18 +196,28 @@ impl HostFileSystem for HostedFileSystem {
     fn create_file(
         &self,
         path: &str,
+        creation: HostCreation,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        blocking_path(self.resolve(path), |path| {
-            fs::File::create_new(path).map(|_| ()).map_err(map_io_error)
+        blocking_path(self.resolve(path), move |path| {
+            let file = fs::File::create_new(&path).map_err(map_io_error)?;
+            if file.metadata().map_err(map_io_error)?.gid() != creation.gid {
+                unix_fs::fchown(&file, None, Some(creation.gid)).map_err(map_io_error)?;
+            }
+            file.set_permissions(fs::Permissions::from_mode(creation.permissions))
+                .map_err(map_io_error)
         })
     }
 
     fn create_directory(
         &self,
         path: &str,
+        creation: HostCreation,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
-        blocking_path(self.resolve(path), |path| {
-            fs::create_dir(path).map_err(map_io_error)
+        blocking_path(self.resolve(path), move |path| {
+            fs::create_dir(&path).map_err(map_io_error)?;
+            in_group(&path, creation.gid)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(creation.permissions))
+                .map_err(map_io_error)
         })
     }
 
@@ -253,10 +263,12 @@ impl HostFileSystem for HostedFileSystem {
         &self,
         target: &str,
         link_path: &str,
+        gid: u32,
     ) -> impl core::future::Future<Output = Result<(), HostFsError>> + Send + '_ {
         let target = PathBuf::from(target);
         blocking_path(self.resolve(link_path), move |link_path| {
-            unix_fs::symlink(target, link_path).map_err(map_io_error)
+            unix_fs::symlink(target, &link_path).map_err(map_io_error)?;
+            in_group(&link_path, gid)
         })
     }
 
@@ -266,6 +278,17 @@ impl HostFileSystem for HostedFileSystem {
     ) -> impl core::future::Future<Output = Result<String, HostFsError>> + Send + '_ {
         blocking_path(self.resolve(path), |path| read_link_impl(&path))
     }
+}
+
+/// Puts the node at `path` in group `gid`, changing nothing when the host
+/// already did (a BSD host gives a new node its directory's group). Run
+/// before setting permission bits so `chown` never strips a set-id bit.
+fn in_group(path: &Path, gid: u32) -> Result<(), HostFsError> {
+    let current = fs::symlink_metadata(path).map_err(map_io_error)?.gid();
+    if current != gid {
+        unix_fs::lchown(path, None, Some(gid)).map_err(map_io_error)?;
+    }
+    Ok(())
 }
 
 /// The attributes of the object `path` names, itself and not what a
@@ -289,6 +312,9 @@ fn stat_impl(path: &Path) -> Result<HostMetadata, HostFsError> {
         qid_path: inode,
         qid_type,
         mode,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        rdev: meta.rdev(),
         size: meta.len(),
         link_count: meta.nlink(),
         access_nanos: unix_timestamp_nanos(meta.atime(), meta.atime_nsec()),
@@ -543,6 +569,71 @@ mod tests {
             .block_on(test);
     }
 
+    /// The group the test root has, which every node made in it can take.
+    fn current_gid(root: &TempDir) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(root.path())
+            .expect("the test root has metadata")
+            .gid()
+    }
+
+    /// A node the share creates takes its group and mode from the
+    /// directory it is made in, with the execute bits cleared for a
+    /// regular file, whatever the process's umask. Its owner is the host's
+    /// to give, here the user that owns the directory too.
+    #[test]
+    fn a_node_created_on_the_share_inherits_from_its_parent() {
+        run_hosted_fs_test(async {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            use helios_hal::fs::{FileSystem, FsPath, OpenFlags};
+            use helios_kernel::HostShare;
+
+            let root = test_root();
+            let gid = current_gid(&root);
+            let share = HostShare::new(filesystem(&root));
+            for (directory, mode, file_mode, child_mode) in [
+                ("中文目录", 0o2750, 0o640, 0o2750),
+                ("日本語のディレクトリ", 0o777, 0o666, 0o777),
+                ("한국어디렉터리", 0o1755, 0o644, 0o755),
+            ] {
+                let path = root.path().join(directory);
+                std::fs::create_dir(&path).expect("directory must be created");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                    .expect("directory mode must be set");
+                let at = |name: &str| format!("{directory}/{name}");
+                let file = at("ファイル");
+                share
+                    .open(
+                        FsPath::new(&file).unwrap(),
+                        OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
+                        0,
+                    )
+                    .await
+                    .expect("file must be created");
+                let child = at("하위");
+                share
+                    .create_directory(FsPath::new(&child).unwrap(), 0)
+                    .await
+                    .expect("directory must be created");
+                let link = at("链接");
+                share
+                    .symlink("ファイル", FsPath::new(&link).unwrap(), 0)
+                    .await
+                    .expect("link must be created");
+                let parent = std::fs::metadata(&path).expect("parent metadata");
+                for (name, expected) in [(&file, file_mode), (&child, child_mode)] {
+                    let made = std::fs::symlink_metadata(root.path().join(name))
+                        .expect("created node metadata");
+                    assert_eq!(made.mode() & 0o7777, expected, "{name}");
+                    assert_eq!((made.uid(), made.gid()), (parent.uid(), gid), "{name}");
+                }
+                let made = std::fs::symlink_metadata(root.path().join(&link)).unwrap();
+                assert_eq!((made.uid(), made.gid()), (parent.uid(), gid), "{link}");
+            }
+        });
+    }
+
     #[test]
     fn hosted_filesystem_supports_links() {
         run_hosted_fs_test(async {
@@ -556,7 +647,7 @@ mod tests {
                 .await
                 .expect("hard link must be created");
             filesystem
-                .symlink("source", "sym")
+                .symlink("source", "sym", current_gid(&root))
                 .await
                 .expect("symlink must be created");
 
@@ -883,6 +974,73 @@ mod tests {
                 .await
                 .expect("alias stat must succeed");
             assert_eq!(alias.identity, metadata.identity);
+        });
+    }
+
+    #[test]
+    fn hosted_filesystem_preserves_set_id_sticky_bits_and_special_nodes() {
+        run_hosted_fs_test(async {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            use std::os::unix::net::UnixListener;
+
+            let root = test_root();
+            let host_meta = std::fs::metadata(root.path()).expect("root metadata");
+            for (name, bits) in [
+                ("suid", 0o4755),
+                ("sgid", 0o2755),
+                ("both", 0o6711),
+                ("sticky", 0o1755),
+            ] {
+                let path = root.path().join(name);
+                std::fs::write(&path, b"#!/bin/sh\n").expect("file must be written");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(bits))
+                    .expect("set-id and sticky bits must be set");
+            }
+            let dir = root.path().join("sgid-dir");
+            std::fs::create_dir(&dir).expect("dir must be created");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o3775))
+                .expect("dir setgid and sticky bits must be set");
+            let sock_path = root.path().join("sock");
+            let _listener = UnixListener::bind(&sock_path).expect("unix socket must bind");
+
+            let filesystem = filesystem(&root);
+            filesystem
+                .create_file(
+                    "sibling",
+                    helios_kernel::HostCreation {
+                        permissions: 0o640,
+                        gid: host_meta.gid(),
+                    },
+                )
+                .await
+                .expect("sibling created");
+            append(&filesystem, "sibling", b"unrelated write")
+                .await
+                .expect("sibling write");
+
+            for (name, bits) in [
+                ("suid", 0o104_755),
+                ("sgid", 0o102_755),
+                ("both", 0o106_711),
+                ("sticky", 0o101_755),
+                ("sgid-dir", 0o043_775),
+            ] {
+                let meta = filesystem.stat_path(name).await.expect("stat must succeed");
+                assert_eq!(meta.mode, bits, "{name}: {:#o}", meta.mode);
+                assert_eq!(
+                    (meta.uid, meta.gid),
+                    (host_meta.uid(), host_meta.gid()),
+                    "{name}"
+                );
+            }
+            let sock = filesystem.stat_path("sock").await.expect("stat socket");
+            assert_eq!(sock.kind().unwrap(), helios_hal::fs::NodeKind::Socket);
+            let refusal =
+                helios_kernel::HostFsErrorKind::Refused(helios_hal::fs::FsError::Unsupported);
+            assert_eq!(
+                filesystem.read_file("sock").await.unwrap_err().kind(),
+                refusal
+            );
         });
     }
 

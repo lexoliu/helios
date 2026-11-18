@@ -87,7 +87,7 @@ pub use error::{
 pub use fs::{DirEntry, DirPosition, Filesystem, Inode, MAX_SYMLINK_FOLLOWS};
 #[cfg(feature = "test-support")]
 pub use fs::{ExtentInfo, ExtentKind};
-pub use items::{EntryTarget, Metadata, Timestamp};
+pub use items::{DeviceNumber, EntryTarget, Metadata, Timestamp};
 pub use key::Key;
 pub use source::{BlockSink, BlockSource, READ_ALIGNMENT};
 pub use superblock::{MIRROR_OFFSETS, RootPointer, Superblock};

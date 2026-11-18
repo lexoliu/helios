@@ -8,7 +8,8 @@ use helios_hal::fs::{
 };
 
 use super::{
-    BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountTable, MountedFs, Namespace,
+    BOOT_DEVICE, Follow, MAX_MOUNTS, MemoryFs, MountError, MountGrant, MountSharing, MountTable,
+    MountedFs, Namespace,
 };
 use crate::test_support::UnsupportedStorage;
 use crate::{
@@ -23,7 +24,26 @@ const IMAGE: EmbeddedBootFs = EmbeddedBootFs::new(
     &[EmbeddedBootFile::new("bin/tool", b"tool", 42)],
 );
 
-const READ_WRITE: FileSystemRights = FileSystemRights::READ.union(FileSystemRights::WRITE);
+const READ_WRITE: MountGrant = MountGrant {
+    rights: FileSystemRights::READ.union(FileSystemRights::WRITE),
+    sharing: MountSharing::Shared,
+};
+
+/// A request for `source` at `/mnt`, shared, with no btrfs options.
+fn request(source: crate::MountSource, read_only: bool) -> crate::MountRequest<'static> {
+    crate::MountRequest {
+        source,
+        point: "/mnt",
+        read_only,
+        sharing: MountSharing::Shared,
+        write: crate::vfs::BtrfsWriteOptions {
+            entropy: crate::test_support::test_root_entropy(),
+            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
+            compress: None,
+            commit: None,
+        },
+    }
+}
 
 fn namespace() -> TestNamespace {
     Namespace::new(MountTable::new(BootFs::new(IMAGE, BOOT_DEVICE), 1))
@@ -307,7 +327,10 @@ fn a_read_only_mount_refuses_changes() {
     block_on(namespace.mount(
         &cap("/mnt"),
         MountedFs::Boot(namespace.table().boot().clone()),
-        FileSystemRights::READ,
+        MountGrant {
+            rights: FileSystemRights::READ,
+            sharing: MountSharing::Private,
+        },
     ))
     .expect("mounts");
     assert_eq!(read(&namespace, "/mnt/bin/tool"), b"tool");
@@ -475,15 +498,7 @@ fn a_mount_request_without_mount_authority_is_refused() {
             &authority,
             &namespace,
             nothing_attached(),
-            crate::MountSource::Memory,
-            "/mnt",
-            false,
-            crate::vfs::BtrfsWriteOptions {
-                entropy: crate::test_support::test_root_entropy(),
-                concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-                compress: None,
-                commit: None,
-            },
+            request(crate::MountSource::Memory, false),
         )),
         Err(crate::MountRequestError::Authority(
             crate::ProcessAuthorityError::MountGrantExceedsAuthority(
@@ -503,17 +518,24 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
         &authority,
         &namespace,
         nothing_attached(),
-        crate::MountSource::BootImage,
-        "/mnt",
-        false,
-        crate::vfs::BtrfsWriteOptions {
-            entropy: crate::test_support::test_root_entropy(),
-            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-            compress: None,
-            commit: None,
+        crate::MountRequest {
+            sharing: MountSharing::Private,
+            ..request(crate::MountSource::BootImage, false)
         },
     ))
     .expect("root may mount the boot image");
+    // The grant the request asked for is the one the mount holds, and the
+    // boot image is read-only whatever the request said.
+    assert_eq!(
+        namespace
+            .resolve("/mnt/bin/tool")
+            .expect("resolves")
+            .grant(),
+        MountGrant {
+            rights: FileSystemRights::READ,
+            sharing: MountSharing::Private,
+        }
+    );
     assert_eq!(read(&namespace, "/mnt/bin/tool"), b"tool");
     assert_eq!(
         namespace
@@ -529,37 +551,214 @@ fn a_mount_request_with_mount_authority_attaches_the_source() {
             &authority,
             &namespace,
             nothing_attached(),
-            crate::MountSource::HostShare,
-            "/mnt",
-            false,
-            crate::vfs::BtrfsWriteOptions {
-                entropy: crate::test_support::test_root_entropy(),
-                concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-                compress: None,
-                commit: None,
-            },
+            request(crate::MountSource::HostShare, false),
         )),
         Err(crate::MountRequestError::HostShareUnavailable)
     ));
     let serial = helios_hal::fs::BlockSerial::new(b"absent").expect("serial fits");
     assert!(matches!(
-            block_on(crate::request_mount(
-                &authority,
-                &namespace,
-                nothing_attached(),
-                crate::MountSource::Disk { serial },
-                "/mnt",
-                true,
-            crate::vfs::BtrfsWriteOptions {
-                entropy: crate::test_support::test_root_entropy(),
-                concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-    compress: None,
-            commit: None,
-            },
+        block_on(crate::request_mount(
+            &authority,
+            &namespace,
+            nothing_attached(),
+            request(crate::MountSource::Disk { serial }, true),
         )),
-            Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial
-        ));
+        Err(crate::MountRequestError::DiskUnavailable { serial: refused }) if refused == serial
+    ));
 
     block_on(crate::request_unmount(&authority, &namespace, "/mnt")).expect("unmounts");
     assert_eq!(owner(&namespace, "/mnt/bin/tool").0, "/");
+}
+
+/// A mount is private or shared from the request that made it until it is
+/// gone, through every resolution, a held one included; the root of a
+/// namespace is shared.
+#[test]
+fn a_mount_keeps_the_sharing_it_was_granted() {
+    let namespace = namespace();
+    let authority = ProcessAuthority::root();
+    for sharing in [MountSharing::Shared, MountSharing::Private] {
+        block_on(crate::request_mount(
+            &authority,
+            &namespace,
+            nothing_attached(),
+            crate::MountRequest {
+                sharing,
+                ..request(crate::MountSource::Memory, false)
+            },
+        ))
+        .expect("root may mount memory");
+        let resolved = namespace
+            .resolve("/mnt/中文/日本語/한국어")
+            .expect("resolves");
+        let granted = MountGrant {
+            rights: FileSystemRights::READ | FileSystemRights::WRITE,
+            sharing,
+        };
+        assert_eq!(resolved.grant(), granted);
+        let held = resolved.held();
+        drop(resolved);
+        assert_eq!(held.resolved().grant(), granted);
+        drop(held);
+        block_on(crate::request_unmount(&authority, &namespace, "/mnt")).expect("unmounts");
+    }
+    assert_eq!(
+        namespace.resolve("/mnt").expect("resolves").grant(),
+        super::ROOT_GRANT
+    );
+    assert_eq!(super::ROOT_GRANT.sharing, MountSharing::Shared);
+}
+
+/// End-to-end check of private and shared mounts over stored Unix metadata:
+/// a private mount exposes stored owner, mode, set-id bits, device nodes and
+/// file capabilities; a shared mount exposes the container's configured owner,
+/// mount-derived modes, `nosuid`, `nodev` and ignored file capabilities.
+#[test]
+fn private_and_shared_mounts_distinguish_container_views_and_capabilities() {
+    use bytes::Bytes;
+    use helios_btrfs::DeviceNumber;
+    use helios_btrfs::write::Special;
+    use helios_hal::fs::FsPath;
+
+    use super::{MountFlags, MountedFs, SharedOwner, UnixAttributes, XattrSetMode};
+
+    const CAPABILITY: &[u8] = &[
+        0x01, 0x00, 0x00, 0x02, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    const CONTAINER: SharedOwner = SharedOwner {
+        uid: 1000,
+        gid: 1000,
+    };
+
+    let namespace = namespace();
+    let tree = MemoryFs::new(namespace.table().allocate_device());
+    let root_owned = |permissions| UnixAttributes {
+        permissions,
+        uid: 0,
+        gid: 0,
+    };
+    tree.create_file_with(
+        FsPath::new("bin-suid").unwrap(),
+        root_owned(0o4755),
+        1_000_000_000,
+    )
+    .unwrap();
+    tree.set_xattr(
+        FsPath::new("bin-suid").unwrap(),
+        "security.capability",
+        Bytes::from_static(CAPABILITY),
+        XattrSetMode::Create,
+        1_000_000_000,
+    )
+    .unwrap();
+    tree.create_directory_with(
+        FsPath::new("dir-sgid").unwrap(),
+        UnixAttributes {
+            permissions: 0o3770,
+            uid: 42,
+            gid: 84,
+        },
+        1_000_000_000,
+    )
+    .unwrap();
+    tree.create_special(
+        FsPath::new("dev-null").unwrap(),
+        Special::CharDevice(DeviceNumber::new(1, 3).unwrap()),
+        root_owned(0o666),
+        1_000_000_000,
+    )
+    .unwrap();
+    tree.symlink_with(
+        "bin-suid",
+        FsPath::new("link").unwrap(),
+        root_owned(0o777),
+        1_000_000_000,
+    )
+    .unwrap();
+
+    // Mounted private: the container sees the stored owner, mode and file
+    // capability, and neither `nosuid` nor `nodev` is set.
+    block_on(namespace.mount(
+        &cap("/mnt"),
+        MountedFs::Memory(tree.clone()),
+        MountGrant {
+            rights: FileSystemRights::READ | FileSystemRights::WRITE,
+            sharing: MountSharing::Private,
+        },
+    ))
+    .expect("private mount");
+    {
+        let resolved = namespace.resolve("/mnt/bin-suid").expect("resolves");
+        let grant = resolved.grant();
+        let stored = tree.unix_metadata(resolved.path()).unwrap();
+        let cap_bytes = tree.xattr(resolved.path(), "security.capability").unwrap();
+        assert_eq!(
+            grant.container_view(stored.kind, stored.attributes, CONTAINER),
+            root_owned(0o4755)
+        );
+        assert!(grant.flags().honours_exec_privileges());
+        assert!(grant.flags().opens_devices());
+        assert_eq!(
+            grant.file_capability(cap_bytes.as_deref()),
+            Some(CAPABILITY)
+        );
+    }
+    block_on(namespace.unmount(&cap("/mnt"))).expect("unmounts");
+
+    // Mounted shared (read-write and read-only): every node appears owned by
+    // `CONTAINER`, modes follow the mount's rights with set-id and sticky
+    // cleared, `nosuid` and `nodev` are set, and file capabilities are ignored.
+    for (rights, file_mode, device_mode) in [
+        (
+            FileSystemRights::READ | FileSystemRights::WRITE,
+            0o777,
+            0o666,
+        ),
+        (FileSystemRights::READ, 0o555, 0o444),
+    ] {
+        block_on(namespace.mount(
+            &cap("/mnt"),
+            MountedFs::Memory(tree.clone()),
+            MountGrant {
+                rights,
+                sharing: MountSharing::Shared,
+            },
+        ))
+        .expect("shared mount");
+        for (name, expected_mode) in [
+            ("bin-suid", file_mode),
+            ("dir-sgid", file_mode),
+            ("dev-null", device_mode),
+            ("link", 0o777),
+        ] {
+            let full = alloc::format!("/mnt/{name}");
+            let resolved = namespace
+                .resolve_entry(&full, Follow::No)
+                .expect("resolves");
+            let grant = resolved.grant();
+            let stored = tree.unix_metadata(resolved.path()).unwrap();
+            assert_eq!(
+                grant.container_view(stored.kind, stored.attributes, CONTAINER),
+                UnixAttributes {
+                    permissions: expected_mode,
+                    uid: CONTAINER.uid,
+                    gid: CONTAINER.gid,
+                },
+                "{name} {rights:?}"
+            );
+            assert!(
+                grant
+                    .flags()
+                    .contains(MountFlags::NO_SUID | MountFlags::NO_DEV)
+            );
+            assert!(!grant.flags().honours_exec_privileges());
+            assert!(!grant.flags().opens_devices());
+        }
+        let resolved = namespace.resolve("/mnt/bin-suid").expect("resolves");
+        let cap_bytes = tree.xattr(resolved.path(), "security.capability").unwrap();
+        assert_eq!(cap_bytes.as_deref(), Some(CAPABILITY));
+        assert_eq!(resolved.grant().file_capability(cap_bytes.as_deref()), None);
+        block_on(namespace.unmount(&cap("/mnt"))).expect("unmounts");
+    }
 }

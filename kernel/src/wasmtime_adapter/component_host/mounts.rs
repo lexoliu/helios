@@ -21,7 +21,9 @@ use helios_hal::fs::BlockSerial;
 use wasmtime::component::{Accessor, HasSelf, Linker};
 
 use super::{StoreData, debugger_bindings, program_bindings};
-use crate::{ComponentHostNetwork, ErofsError, MountError, MountRequestError, MountSource};
+use crate::{
+    ComponentHostNetwork, ErofsError, MountError, MountRequestError, MountSharing, MountSource,
+};
 
 /// The kind of refusal the guest sees, and the detail it reads.
 fn refusal(error: &MountRequestError) -> (RefusalKind, String) {
@@ -183,10 +185,16 @@ macro_rules! impl_mount_bindings {
                                 &authority,
                                 &namespace,
                                 attached,
-                                source,
-                                &request.path,
-                                request.read_only,
-                                write,
+                                crate::MountRequest {
+                                    source,
+                                    point: &request.path,
+                                    read_only: request.read_only,
+                                    sharing: match request.sharing {
+                                        wit::MountSharing::Private => MountSharing::Private,
+                                        wit::MountSharing::Shared => MountSharing::Shared,
+                                    },
+                                    write,
+                                },
                             )
                             .await
                         }

@@ -8,22 +8,25 @@
 //! `/etc/fstab` holds one mount per line, `#` starting a comment:
 //!
 //! ```text
-//! <source> <mount point> [<option>[,<option>]...]
+//! <source> <mount point> <option>[,<option>]...
 //! ```
 //!
 //! Sources are `memory`, `boot-image`, `host-share`, `disk:<serial>`
 //! for EROFS, and `btrfs:<serial>` for btrfs. Disk sources use the serial
-//! the device reported. The options are `ro` or `rw` (default `rw`; the
-//! boot image and EROFS disks remain read-only) and, for btrfs, Linux's
-//! `compress` (zlib) or `compress=<algorithm>[:<level>]` and
-//! `commit=<seconds>`. A line init cannot parse, or a mount the kernel
-//! refuses, fails init.
+//! the device reported. Every line names `private` or `shared`, which the
+//! mount is granted as for its whole life: a private mount belongs to one
+//! container, which sees the Unix metadata its filesystem stores, and a
+//! shared one may be seen by many, each of which sees it as WASI does. The
+//! other options are `ro` or `rw` (default `rw`; the boot image and EROFS
+//! disks remain read-only) and, for btrfs, Linux's `compress` (zlib) or
+//! `compress=<algorithm>[:<level>]` and `commit=<seconds>`. A line init
+//! cannot parse, or a mount the kernel refuses, fails init.
 
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
 
-use helios_api::mounts::{self, MountSource};
+use helios_api::mounts::{self, MountSharing, MountSource};
 use helios_api::programs::{self, ExecRequest};
 
 const FSTAB: &str = "/etc/fstab";
@@ -36,6 +39,7 @@ struct Mount {
     label: String,
     point: String,
     read_only: bool,
+    sharing: MountSharing,
     /// The value of the `compress=` option, when the line carries one.
     compress: Option<String>,
     /// The value of the `commit=` option, in seconds.
@@ -76,16 +80,13 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let (label, point, options) = match fields.as_slice() {
-            [label, point] => (*label, *point, "rw"),
-            [label, point, options] => (*label, *point, *options),
-            _ => {
-                return Err(invalid(
-                    number,
-                    "expected `<source> <mount point> [<option>[,<option>]...]`",
-                ));
-            }
+        let [label, point, options] = fields.as_slice() else {
+            return Err(invalid(
+                number,
+                "expected `<source> <mount point> <option>[,<option>]...`",
+            ));
         };
+        let (label, point, options) = (*label, *point, *options);
         let source = match label {
             "memory" => MountSource::Memory,
             "boot-image" => MountSource::BootImage,
@@ -103,12 +104,27 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
             },
         };
         let mut read_only = false;
+        let mut sharing = None;
         let mut compress = None;
         let mut commit = None;
         for option in options.split(',') {
             match option {
                 "ro" => read_only = true,
                 "rw" => read_only = false,
+                "private" | "shared" => {
+                    let chosen = if option == "private" {
+                        MountSharing::Private
+                    } else {
+                        MountSharing::Shared
+                    };
+                    if sharing.is_some_and(|earlier| earlier != chosen) {
+                        return Err(invalid(
+                            number,
+                            "a mount is `private` or `shared`, not both",
+                        ));
+                    }
+                    sharing = Some(chosen);
+                }
                 // Linux's bare `compress` selects zlib at its default level.
                 "compress" => compress = Some("zlib".to_owned()),
                 _ => {
@@ -124,11 +140,18 @@ fn parse_fstab(text: &str) -> io::Result<Vec<Mount>> {
                 }
             }
         }
+        let sharing = sharing.ok_or_else(|| {
+            invalid(
+                number,
+                "the options name neither `private` nor `shared`, which every mount is granted as",
+            )
+        })?;
         mounts.push(Mount {
             source,
             label: label.to_owned(),
             point: point.to_owned(),
             read_only,
+            sharing,
             compress,
             commit,
         });
@@ -207,6 +230,7 @@ async fn main() -> io::Result<()> {
             mount.source.clone(),
             mount.point.as_str(),
             mount.read_only,
+            mount.sharing,
             mount.compress.clone(),
             mount.commit,
         )
@@ -238,6 +262,8 @@ async fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use helios_api::mounts::MountSharing;
+
     use super::{commit_seconds, parse_fstab};
 
     #[test]
@@ -261,10 +287,45 @@ mod tests {
     #[test]
     fn an_fstab_line_carries_its_commit_interval() {
         let mounts =
-            parse_fstab("btrfs:数据-データ-데이터 /btrfs rw,compress=zstd:3,commit=120\n").unwrap();
+            parse_fstab("btrfs:数据-データ-데이터 /btrfs rw,shared,compress=zstd:3,commit=120\n")
+                .unwrap();
         assert_eq!(mounts[0].commit, Some(120));
         assert_eq!(mounts[0].compress.as_deref(), Some("zstd:3"));
-        assert!(parse_fstab("btrfs:disk /btrfs commit=soon\n").is_err());
-        assert_eq!(parse_fstab("memory /tmp\n").unwrap()[0].commit, None);
+        assert!(parse_fstab("btrfs:disk /btrfs shared,commit=soon\n").is_err());
+        assert_eq!(parse_fstab("memory /tmp shared\n").unwrap()[0].commit, None);
+    }
+
+    #[test]
+    fn every_fstab_line_names_whether_its_mount_is_private_or_shared() {
+        let text = "\
+btrfs:中文磁盘 /中文 private,rw
+btrfs:日本語ディスク /日本語 shared
+host-share /한국어 ro,shared
+";
+        let mounts = parse_fstab(text).unwrap();
+        let granted: Vec<_> = mounts
+            .iter()
+            .map(|mount| (mount.point.as_str(), mount.sharing, mount.read_only))
+            .collect();
+        assert_eq!(
+            granted,
+            [
+                ("/中文", MountSharing::Private, false),
+                ("/日本語", MountSharing::Shared, false),
+                ("/한국어", MountSharing::Shared, true),
+            ]
+        );
+        // Neither, both, or no options at all: init refuses the line.
+        for line in [
+            "memory /tmp\n",
+            "memory /tmp rw\n",
+            "memory /tmp private,shared\n",
+            "memory /tmp shared,private\n",
+        ] {
+            assert!(parse_fstab(line).is_err(), "{line:?}");
+        }
+        // Naming the same one twice is no contradiction.
+        let twice = parse_fstab("memory /tmp shared,shared\n").unwrap();
+        assert_eq!(twice[0].sharing, MountSharing::Shared);
     }
 }

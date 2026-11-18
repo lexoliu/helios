@@ -1,2 +1,2 @@
-disk:erofs-smoke /image ro
-btrfs:btrfs-smoke /btrfs rw,compress=zstd:3
+disk:erofs-smoke /image ro,shared
+btrfs:btrfs-smoke /btrfs rw,shared,compress=zstd:3

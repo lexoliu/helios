@@ -16,7 +16,7 @@ use super::BtrfsFs;
 use crate::io::{MemoryDisk, cache_over};
 use crate::test_support::UnsupportedHostFileSystem;
 use crate::vfs::{
-    AttachedStorage, BOOT_DEVICE, Follow, MountSource, MountTable, Namespace, Storage,
+    AttachedStorage, BOOT_DEVICE, Follow, MountRequest, MountSource, MountTable, Namespace, Storage,
 };
 use crate::{BootFs, EmbeddedBootDirectory, EmbeddedBootFs, ProcessAuthority, request_mount};
 
@@ -26,6 +26,28 @@ struct MemoryStorage;
 impl Storage for MemoryStorage {
     type HostShare = UnsupportedHostFileSystem;
     type Disk = MemoryDisk;
+}
+
+/// A shared mount of `source` at `/mnt` with `write`.
+fn mount_request(
+    source: MountSource,
+    read_only: bool,
+    write: crate::vfs::BtrfsWriteOptions,
+) -> MountRequest<'static> {
+    MountRequest {
+        source,
+        point: "/mnt",
+        read_only,
+        sharing: crate::MountSharing::Shared,
+        write,
+    }
+}
+
+/// The btrfs image on the test disk.
+fn btrfs_source() -> MountSource {
+    MountSource::Btrfs {
+        serial: BlockSerial::new(b"btrfs-test").unwrap(),
+    }
 }
 
 fn options(time: Timestamp) -> FormatOptions {
@@ -49,21 +71,26 @@ fn formatted_cache(
     options: FormatOptions,
     read_only: bool,
 ) -> crate::BlockCache<MemoryDisk> {
-    // ferrosys' default geometry requires a volume above 109 MiB.
-    let size = 128 << 20;
+    cache_over(&formatted_disk(tree, options, read_only), 256, 1)
+}
+
+/// The bytes of a formatted volume: ferrosys' default geometry requires a
+/// volume above 109 MiB.
+const FORMATTED_BYTES: usize = 128 << 20;
+
+fn formatted_disk(tree: TreeBuilder, options: FormatOptions, read_only: bool) -> MemoryDisk {
+    let size = FORMATTED_BYTES as u64;
     let mut image = tempfile::tempfile().expect("image file");
     image.set_len(size).expect("image length");
     format_to(&mut image, tree, size, options).expect("formats btrfs");
     image.seek(SeekFrom::Start(0)).expect("rewinds");
     let mut bytes = Vec::new();
     image.read_to_end(&mut bytes).expect("reads image");
-    let disk = if read_only {
+    if read_only {
         MemoryDisk::holding("btrfs-test", &bytes, false)
     } else {
         MemoryDisk::holding_writable("btrfs-test", &bytes)
-    };
-    drop(bytes);
-    cache_over(&disk, 256, 1)
+    }
 }
 
 fn path(value: &str) -> FsPath<'_> {
@@ -374,17 +401,7 @@ fn mounted_image_preserves_subvolume_identity_links_and_directory_cookies() {
             host_share: None,
             disks: Some(cache),
         },
-        MountSource::Btrfs {
-            serial: BlockSerial::new(b"btrfs-test").unwrap(),
-        },
-        "/mnt",
-        true,
-        crate::vfs::BtrfsWriteOptions {
-            entropy: crate::test_support::test_root_entropy(),
-            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-            compress: None,
-            commit: None,
-        },
+        mount_request(btrfs_source(), true, write_options(1, None)),
     ))
     .expect("mount request");
     let resolved = namespace.resolve("/mnt/hello").expect("mounted file");
@@ -420,17 +437,7 @@ fn a_writable_mount_links_a_file_created_through_the_namespace() {
             host_share: None,
             disks: Some(cache),
         },
-        MountSource::Btrfs {
-            serial: BlockSerial::new(b"btrfs-test").unwrap(),
-        },
-        "/mnt",
-        false,
-        crate::vfs::BtrfsWriteOptions {
-            entropy: crate::test_support::test_root_entropy(),
-            concurrency: core::num::NonZeroUsize::new(1).unwrap(),
-            compress: None,
-            commit: None,
-        },
+        mount_request(btrfs_source(), false, write_options(1, None)),
     ))
     .expect("mount request")
     .expect("a writable btrfs mount returns its service");
@@ -675,6 +682,146 @@ fn writable_service_publishes_namespace_and_survives_remount() {
             reopened.read_link(path("dir/symlink")).await.unwrap(),
             "moved"
         );
+    });
+}
+
+/// The device's bytes as a source the btrfs reader mounts, to read back the
+/// Unix metadata the filesystem contract does not report.
+struct Bytes(Vec<u8>);
+
+impl helios_btrfs::BlockSource for Bytes {
+    fn size_bytes(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    async fn read_at(&self, offset: u64, output: &mut [u8]) -> helios_hal::io::IoResult<()> {
+        let start = offset as usize;
+        output.copy_from_slice(&self.0[start..start + output.len()]);
+        Ok(())
+    }
+}
+
+/// A node created through the filesystem contract, which carries no creator
+/// identity, takes its owner and group from its parent directory, and its
+/// mode from the parent's with the execute bits cleared for a regular file
+/// (lexoliu/helios#1037).
+#[test]
+fn a_node_created_without_an_identity_inherits_from_its_parent() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let directories: [(&str, u16, u32, u32); 3] = [
+        ("中文目录", 0o2775, 1000, 100),
+        ("日本語のディレクトリ", 0o1777, 0, 0),
+        ("한국어디렉터리", 0o750, 7, 8),
+    ];
+    let mut tree = TreeBuilder::new().root(Metadata::new(0o755, time));
+    for (name, mode, uid, gid) in directories {
+        tree = tree.directory(
+            alloc::format!("/{name}"),
+            Metadata::new(mode, time).owned_by(uid, gid),
+        );
+    }
+    let disk = formatted_disk(tree, FormatOptions::new([0x63; 16], time), false);
+    let cache = cache_over(&disk, 256, 1);
+    block_on(async {
+        let (fs, service) =
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(120), write_options(1, None))
+                .await
+                .expect("writable mount");
+        let client = async move {
+            for (name, ..) in directories {
+                let file = alloc::format!("{name}/ファイル");
+                fs.open(path(&file), OpenFlags::CREATE, 1_000_000_000)
+                    .await
+                    .expect("create");
+                let child = alloc::format!("{name}/하위");
+                fs.create_directory(path(&child), 1_000_000_000)
+                    .await
+                    .expect("mkdir");
+                let link = alloc::format!("{name}/链接");
+                fs.symlink("ファイル", path(&link), 1_000_000_000)
+                    .await
+                    .expect("symlink");
+            }
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
+    });
+    let view = block_on(helios_btrfs::Filesystem::mount(Bytes(
+        disk.bytes_at(0, FORMATTED_BYTES),
+    )))
+    .expect("the committed image mounts");
+    for (name, mode, uid, gid) in directories {
+        let parent = block_on(view.resolve(alloc::format!("/{name}").as_bytes())).unwrap();
+        let made = |child: &str| {
+            let inode = block_on(view.lookup(&parent, child.as_bytes()))
+                .unwrap()
+                .expect("created");
+            let metadata = *inode.metadata();
+            (metadata.permissions, metadata.uid, metadata.gid)
+        };
+        let mode = u32::from(mode);
+        // Execute cleared, and no set-id or sticky bit, for the file.
+        assert_eq!(made("ファイル"), (mode & 0o666, uid, gid), "{name}");
+        // The directory keeps the set-group-id bit and only that.
+        assert_eq!(made("하위"), (mode & 0o2777, uid, gid), "{name}");
+        assert_eq!(made("链接"), (0o777, uid, gid), "{name}");
+    }
+}
+
+#[test]
+fn writable_mount_refuses_to_open_special_nodes_and_keeps_them_across_writes() {
+    let time = Timestamp::from_secs(1_700_000_000);
+    let tree = TreeBuilder::new()
+        .root(Metadata::new(0o755, time))
+        .char_device("/chr", 1, 3, Metadata::new(0o660, time))
+        .block_device("/blk", 8, 0, Metadata::new(0o660, time))
+        .fifo("/fifo", Metadata::new(0o640, time))
+        .socket("/sock", Metadata::new(0o600, time));
+    let disk = formatted_disk(tree, FormatOptions::new([0x64; 16], time), false);
+    let cache = cache_over(&disk, 256, 1);
+    block_on(async {
+        let (fs, service) =
+            BtrfsFs::mount_writable(cache.disk(0), || DeviceId::new(121), write_options(1, None))
+                .await
+                .expect("writable mount");
+        let client = async move {
+            for (name, expected_kind, expected_err) in [
+                (
+                    "chr",
+                    helios_hal::fs::NodeKind::CharacterDevice,
+                    helios_hal::fs::FsError::NotPermitted,
+                ),
+                (
+                    "blk",
+                    helios_hal::fs::NodeKind::BlockDevice,
+                    helios_hal::fs::FsError::NotPermitted,
+                ),
+                (
+                    "fifo",
+                    helios_hal::fs::NodeKind::Fifo,
+                    helios_hal::fs::FsError::Unsupported,
+                ),
+                (
+                    "sock",
+                    helios_hal::fs::NodeKind::Socket,
+                    helios_hal::fs::FsError::Unsupported,
+                ),
+            ] {
+                assert_eq!(fs.stat(path(name)).await.unwrap().kind, expected_kind);
+                assert_eq!(
+                    fs.open(path(name), OpenFlags::empty(), 1_000_000_000)
+                        .await
+                        .map(drop),
+                    Err(expected_err),
+                    "{name}"
+                );
+            }
+            fs.open(path("neighbor"), OpenFlags::CREATE, 1_000_000_000)
+                .await
+                .expect("creates regular file beside special nodes");
+            drop(fs);
+        };
+        futures::future::join(client, service.run(idle_timer())).await;
     });
 }
 
@@ -1183,15 +1330,14 @@ fn request_writable(
             host_share: None,
             disks: Some(cache_over(disk, 256, 1)),
         },
-        MountSource::Btrfs {
-            serial: BlockSerial::new(b"btrfs-test").unwrap(),
-        },
-        "/mnt",
-        false,
-        crate::vfs::BtrfsWriteOptions {
-            commit,
-            ..write_options(1, None)
-        },
+        mount_request(
+            btrfs_source(),
+            false,
+            crate::vfs::BtrfsWriteOptions {
+                commit,
+                ..write_options(1, None)
+            },
+        ),
     ))
     .expect("mount request")
     .expect("a writable btrfs mount returns its service")
@@ -1322,13 +1468,14 @@ fn the_commit_option_of_a_mount_request_sets_its_interval() {
                 host_share: None,
                 disks: None,
             },
-            MountSource::Memory,
-            "/mnt",
-            false,
-            crate::vfs::BtrfsWriteOptions {
-                commit: Some(CommitPolicy::from_commit_option(5)),
-                ..write_options(1, None)
-            },
+            mount_request(
+                MountSource::Memory,
+                false,
+                crate::vfs::BtrfsWriteOptions {
+                    commit: Some(CommitPolicy::from_commit_option(5)),
+                    ..write_options(1, None)
+                },
+            ),
         )),
         Err(crate::MountRequestError::CommitUnsupported)
     ));

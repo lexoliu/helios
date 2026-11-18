@@ -41,8 +41,16 @@ use helios_hal::fs::{
 };
 
 use super::memory::UpperView;
-use super::{FileContents, MemoryFs, read_all};
+use super::{FileContents, MemoryFs, UnixAttributes, read_all};
 use crate::BootFs;
+
+/// The Unix attributes the boot image's directories hold; its files and
+/// links take [`UnixAttributes::inherited`] from this.
+const BOOT_UNIX: UnixAttributes = UnixAttributes {
+    permissions: 0o755,
+    uid: 0,
+    gid: 0,
+};
 
 /// A namespace's root: its own writable tree over the shared boot image.
 #[derive(Clone)]
@@ -79,6 +87,16 @@ impl RootFs {
 
     pub fn lower(&self) -> &BootFs {
         &self.lower
+    }
+
+    /// The Unix attributes of the object at `path`, from whichever layer
+    /// serves it.
+    pub fn unix_attributes(&self, path: FsPath<'_>) -> FsResult<UnixAttributes> {
+        let found = self.find(path)?;
+        match found.layer {
+            Layer::Upper => Ok(self.upper.unix_metadata(path)?.attributes),
+            Layer::Lower => Ok(BOOT_UNIX.inherited(found.metadata.kind)),
+        }
     }
 
     /// The whole of the file at `path`, typed by the layer that served it:
@@ -130,8 +148,13 @@ impl RootFs {
                 return Err(FsError::NotDirectory);
             }
             if found.layer == Layer::Lower {
-                self.upper
-                    .copy_up(prefix, NodeKind::Directory, Bytes::new(), &found.metadata)?;
+                self.upper.copy_up(
+                    prefix,
+                    NodeKind::Directory,
+                    BOOT_UNIX,
+                    Bytes::new(),
+                    &found.metadata,
+                )?;
             }
         }
         Ok(())
@@ -150,8 +173,7 @@ impl RootFs {
             NodeKind::File => self.lower.file_contents(path)?.to_bytes(),
             NodeKind::Symlink => Bytes::from(self.lower.link_target(path)?),
             NodeKind::Directory => Bytes::new(),
-            // The boot image holds none, and the upper tree cannot hold a
-            // report-only node.
+            // The boot image holds none of these kinds.
             NodeKind::CharacterDevice
             | NodeKind::BlockDevice
             | NodeKind::Fifo
@@ -160,8 +182,13 @@ impl RootFs {
         if let Some((parent, _)) = path.split_last() {
             self.copy_up_directories(parent)?;
         }
-        self.upper
-            .copy_up(path, found.metadata.kind, contents, &found.metadata)?;
+        self.upper.copy_up(
+            path,
+            found.metadata.kind,
+            BOOT_UNIX.inherited(found.metadata.kind),
+            contents,
+            &found.metadata,
+        )?;
         self.find(path)
     }
 

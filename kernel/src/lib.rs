@@ -238,9 +238,9 @@ pub use profiling::{
 };
 pub use runtime::{
     AuthorityDomain, ComponentHostNetwork, ComponentNetworkService, ComponentNetworkState,
-    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostDirEntry, HostDirLimit, HostFileSystem,
-    HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite,
-    Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
+    DnsError, DnsErrorKind, ExecOutput, ExecResult, HostCreation, HostDirEntry, HostDirLimit,
+    HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore,
+    HostWrite, Ipv4Address, NetworkErrorDetail, NetworkHandle, NetworkIpAddress, NetworkPacketPump,
     ObjectIdentity, PingError, PingErrorKind, PingReply, RegisteredTcpReadBuffer, RuntimeState,
     SocketReadiness, TcpAccepted, TcpError, TcpErrorKind, TcpListener, TcpReadInto,
     TcpReadProgress, TcpWriteProgress, UdpBinding, UdpDatagram, UdpError, UdpErrorKind,
@@ -258,10 +258,11 @@ pub use surface::{
 pub use vfs::{
     AttachedStorage, BOOT_DEVICE, DiskImage, ErofsError, ErofsFs, FileContents, Follow,
     FsDescriptor, FsDescriptorFlags, HeldPath, HostShare, HostShareWrite, MAX_MOUNTS,
-    MAX_SYMLINK_DEPTH, MemoryFs, MemoryWrite, MountError, MountHold, MountRequestError,
-    MountSource, MountTable, MountedFs, MountedWrite, Namespace, NoDisks, ROOT_LAYER_DEVICE,
-    ReaderError, Resolved, RootFs, RootWrite, Storage, object_identity, request_mount,
-    request_unmount, symlink_target, within_directory,
+    MAX_SYMLINK_DEPTH, MemoryFs, MemoryUnixMetadata, MemoryWrite, MountError, MountFlags,
+    MountGrant, MountHold, MountRequest, MountRequestError, MountSharing, MountSource, MountTable,
+    MountedFs, MountedWrite, Namespace, NoDisks, ROOT_GRANT, ROOT_LAYER_DEVICE, ReaderError,
+    Resolved, RootFs, RootWrite, SharedOwner, Storage, UnixAttributes, XattrSetMode,
+    object_identity, request_mount, request_unmount, symlink_target, within_directory,
 };
 pub use vsock::{
     ComponentHostVsockService, MAX_VSOCK_BACKLOG, MAX_VSOCK_CONNECTIONS, MAX_VSOCK_LISTENERS,

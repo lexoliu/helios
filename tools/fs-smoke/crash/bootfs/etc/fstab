@@ -1,2 +1,2 @@
-btrfs:btrfs-smoke /btrfs rw,compress=zstd:3
-host-share /host rw
+btrfs:btrfs-smoke /btrfs rw,shared,compress=zstd:3
+host-share /host rw,shared

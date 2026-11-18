@@ -45,7 +45,7 @@ use crate::transaction::reflink::{CloneRange as RawCloneRange, FileId};
 use crate::transaction::reserve::Units;
 use crate::transaction::{Checkpoint, Transaction};
 use crate::tree::write::WriteError;
-use crate::{Error, FileKind, Metadata, Timestamp};
+use crate::{DeviceNumber, Error, FileKind, Metadata, Timestamp};
 
 /// The dirty metadata a running transaction holds before it is committed,
 /// unless the mount's operator chose another bound: Linux's
@@ -90,7 +90,9 @@ impl InodeHandle {
 }
 
 /// Permissions and ownership for a newly created entry. File type is selected
-/// by create_file, create_directory or symlink, never by permission bits.
+/// by create_file, create_directory, symlink or create_special, never by
+/// permission bits. Every bit of `07777` is stored as given, the set-id and
+/// sticky bits included, on every kind of inode.
 #[derive(Clone, Copy, Debug)]
 pub struct Attributes {
     pub permissions: u32,
@@ -100,6 +102,10 @@ pub struct Attributes {
 
 impl Attributes {
     fn raw(self, kind: u32) -> Result<RawAttributes, WriteError> {
+        self.raw_with_device(kind, 0)
+    }
+
+    fn raw_with_device(self, kind: u32, rdev: u64) -> Result<RawAttributes, WriteError> {
         if self.permissions & !0o7777 != 0 {
             return Err(WriteError::InvalidPermissions {
                 permissions: self.permissions,
@@ -109,7 +115,30 @@ impl Attributes {
             mode: kind | self.permissions,
             uid: self.uid,
             gid: self.gid,
+            rdev,
         })
+    }
+}
+
+/// A node `mknod` makes that holds no data: a device node, a FIFO or a
+/// socket, as `btrfs_mknod` in `fs/btrfs/inode.c` creates them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Special {
+    CharDevice(DeviceNumber),
+    BlockDevice(DeviceNumber),
+    Fifo,
+    Socket,
+}
+
+impl Special {
+    /// The file type bits of the mode, and the inode item's `rdev`.
+    fn mode_and_rdev(self) -> (u32, u64) {
+        match self {
+            Self::CharDevice(device) => (0o020_000, device.inode_item()),
+            Self::BlockDevice(device) => (0o060_000, device.inode_item()),
+            Self::Fifo => (0o010_000, 0),
+            Self::Socket => (0o140_000, 0),
+        }
     }
 }
 
@@ -579,8 +608,8 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         operation.accept()
     }
 
-    /// Replaces the permission bits (`07777`, with the set-id bits refused on
-    /// a non-directory with [`WriteError::SetId`]) and stamps `changed`.
+    /// Replaces the permission bits (`07777`, the set-id and sticky bits
+    /// included on every kind of inode) and stamps `changed`.
     pub async fn set_permissions(
         &mut self,
         file: &InodeHandle,
@@ -634,6 +663,20 @@ impl<S: BlockSink, U: RootUuids> WriteTransaction<'_, S, U> {
         when: Timestamp,
     ) -> Result<InodeHandle, WriteError> {
         self.create(name, attributes.raw(0o040000)?, when).await
+    }
+
+    /// Creates a device node, a FIFO or a socket, as `mknod`. The node holds
+    /// no data; a device node keeps the number it names.
+    pub async fn create_special(
+        &mut self,
+        name: Name<'_>,
+        special: Special,
+        attributes: Attributes,
+        when: Timestamp,
+    ) -> Result<InodeHandle, WriteError> {
+        let (kind, rdev) = special.mode_and_rdev();
+        self.create(name, attributes.raw_with_device(kind, rdev)?, when)
+            .await
     }
 
     async fn create(

@@ -121,8 +121,20 @@ fn mount_memory(namespace: &TestNamespace, point: &str) {
     let cap = crate::ProcessAuthority::root()
         .derive_mount_cap(point)
         .expect("root may mount anywhere");
-    block_on(namespace.mount(&cap, fs, FileSystemRights::READ | FileSystemRights::WRITE))
-        .expect("mount must succeed");
+    block_on(namespace.mount(
+        &cap,
+        fs,
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .expect("mount must succeed");
+}
+
+/// A shared mount granting `rights`.
+fn granted(rights: FileSystemRights) -> crate::MountGrant {
+    crate::MountGrant {
+        rights,
+        sharing: crate::MountSharing::Shared,
+    }
 }
 
 #[test]
@@ -971,8 +983,12 @@ fn mount_unreachable_host(namespace: &TestNamespace, point: &str) {
     let cap = crate::ProcessAuthority::root()
         .derive_mount_cap(point)
         .expect("root may mount anywhere");
-    block_on(namespace.mount(&cap, fs, FileSystemRights::READ | FileSystemRights::WRITE))
-        .expect("mount must succeed");
+    block_on(namespace.mount(
+        &cap,
+        fs,
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .expect("mount must succeed");
 }
 
 /// A directory descriptor at `path` that holds exactly `flags`.
@@ -1693,7 +1709,8 @@ fn a_create_lands_on_the_mount_that_owns_the_new_entry() {
     let cap = crate::ProcessAuthority::root()
         .derive_mount_cap("/mnt")
         .expect("root may mount anywhere");
-    block_on(namespace.mount(&cap, fs, FileSystemRights::READ)).expect("mount must succeed");
+    block_on(namespace.mount(&cap, fs, granted(FileSystemRights::READ)))
+        .expect("mount must succeed");
 
     let created = open(
         &namespace,
@@ -1803,32 +1820,40 @@ impl MemoryHostFileSystem {
             .ok_or(crate::HostFsError::Protocol("invalid host path"))
     }
 
-    fn host_metadata(&self, metadata: helios_hal::fs::Metadata) -> crate::HostMetadata {
-        let mode = match metadata.kind {
-            NodeKind::Directory => 0o040_755,
-            NodeKind::File => 0o100_644,
-            NodeKind::Symlink => 0o120_777,
-            NodeKind::CharacterDevice => 0o020_666,
-            NodeKind::BlockDevice => 0o060_660,
-            NodeKind::Fifo => 0o010_644,
-            NodeKind::Socket => 0o140_755,
+    fn host_metadata(
+        &self,
+        path: helios_hal::fs::FsPath<'_>,
+        metadata: helios_hal::fs::Metadata,
+    ) -> Result<crate::HostMetadata, crate::HostFsError> {
+        let unix = self.inner.unix_metadata(path).map_err(Self::host_error)?;
+        let kind_bits = match metadata.kind {
+            NodeKind::Directory => 0o040_000,
+            NodeKind::File => 0o100_000,
+            NodeKind::Symlink => 0o120_000,
+            NodeKind::CharacterDevice => 0o020_000,
+            NodeKind::BlockDevice => 0o060_000,
+            NodeKind::Fifo => 0o010_000,
+            NodeKind::Socket => 0o140_000,
         };
         let qid_type = match metadata.kind {
             NodeKind::Directory => 0x80,
             NodeKind::Symlink => 0x02,
             _ => 0x00,
         };
-        crate::HostMetadata {
+        Ok(crate::HostMetadata {
             identity: crate::ObjectIdentity::new(self.domain, metadata.id.inode),
             qid_path: metadata.id.inode,
             qid_type,
-            mode,
+            mode: kind_bits | unix.attributes.permissions,
+            uid: unix.attributes.uid,
+            gid: unix.attributes.gid,
+            rdev: u64::from(unix.rdev.encode()),
             size: metadata.size,
             link_count: metadata.link_count,
             access_nanos: metadata.access_nanos,
             modified_nanos: metadata.modified_nanos,
             status_nanos: metadata.status_nanos,
-        }
+        })
     }
 }
 
@@ -1849,7 +1874,7 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
         let path = Self::fs_path(path)?;
         use helios_hal::fs::FileSystem as _;
         let metadata = self.inner.stat(path).await.map_err(Self::host_error)?;
-        Ok(self.host_metadata(metadata))
+        self.host_metadata(path, metadata)
     }
 
     async fn read_dir(
@@ -1943,22 +1968,50 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
             .map_err(Self::host_error)
     }
 
-    async fn create_file(&self, path: &str) -> Result<(), crate::HostFsError> {
+    async fn create_file(
+        &self,
+        path: &str,
+        creation: crate::HostCreation,
+    ) -> Result<(), crate::HostFsError> {
         let path = Self::fs_path(path)?;
-        use helios_hal::fs::FileSystem as _;
+        let parent_uid = path
+            .split_last()
+            .and_then(|(parent, _)| self.inner.unix_metadata(parent).ok())
+            .map_or(0, |meta| meta.attributes.uid);
         self.inner
-            .open(path, helios_hal::fs::OpenFlags::CREATE, 1)
-            .await
+            .create_file_with(
+                path,
+                crate::UnixAttributes {
+                    permissions: creation.permissions,
+                    uid: parent_uid,
+                    gid: creation.gid,
+                },
+                1,
+            )
             .map(|_| ())
             .map_err(Self::host_error)
     }
 
-    async fn create_directory(&self, path: &str) -> Result<(), crate::HostFsError> {
+    async fn create_directory(
+        &self,
+        path: &str,
+        creation: crate::HostCreation,
+    ) -> Result<(), crate::HostFsError> {
         let path = Self::fs_path(path)?;
-        use helios_hal::fs::FileSystem as _;
+        let parent_uid = path
+            .split_last()
+            .and_then(|(parent, _)| self.inner.unix_metadata(parent).ok())
+            .map_or(0, |meta| meta.attributes.uid);
         self.inner
-            .create_directory(path, 1)
-            .await
+            .create_directory_with(
+                path,
+                crate::UnixAttributes {
+                    permissions: creation.permissions,
+                    uid: parent_uid,
+                    gid: creation.gid,
+                },
+                1,
+            )
             .map_err(Self::host_error)
     }
 
@@ -1995,12 +2048,28 @@ impl crate::HostFileSystem for MemoryHostFileSystem {
             .map_err(Self::host_error)
     }
 
-    async fn symlink(&self, target: &str, link_path: &str) -> Result<(), crate::HostFsError> {
+    async fn symlink(
+        &self,
+        target: &str,
+        link_path: &str,
+        gid: u32,
+    ) -> Result<(), crate::HostFsError> {
         let link_path = Self::fs_path(link_path)?;
-        use helios_hal::fs::FileSystem as _;
+        let parent_uid = link_path
+            .split_last()
+            .and_then(|(parent, _)| self.inner.unix_metadata(parent).ok())
+            .map_or(0, |meta| meta.attributes.uid);
         self.inner
-            .symlink(target, link_path, 1)
-            .await
+            .symlink_with(
+                target,
+                link_path,
+                crate::UnixAttributes {
+                    permissions: 0o777,
+                    uid: parent_uid,
+                    gid,
+                },
+                1,
+            )
             .map_err(Self::host_error)
     }
 
@@ -2060,7 +2129,7 @@ fn memory_host_store_data() -> (
     block_on(namespace.mount(
         &cap,
         MountedFs::Host(HostShare::new(host_fs.clone())),
-        FileSystemRights::READ | FileSystemRights::WRITE,
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
     ))
     .expect("host mount must succeed");
 
@@ -2626,5 +2695,274 @@ fn host_share_and_embedded_symlinks_honor_symlink_follow_across_stat_open_and_se
         .unwrap();
         assert_eq!(link_after.access_nanos, 1_000_000_111);
         assert_eq!(link_after.modified_nanos, 2_000_000_222);
+    }
+}
+
+#[test]
+fn wasi_ignores_unix_metadata_and_inherits_from_parent_across_writable_mounts() {
+    use bytes::Bytes;
+    use core::num::NonZeroUsize;
+    use ferrosys::{
+        FormatOptions, Metadata as BtrfsSeedMeta, Timestamp as BtrfsStamp, TreeBuilder, format_to,
+    };
+    use helios_hal::fs::{DeviceId, FsPath};
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    use crate::io::{MemoryDisk, cache_over};
+    use crate::vfs::{BtrfsFs, BtrfsWriteOptions};
+    use crate::{BOOT_DEVICE, EmbeddedBootFs, MountTable, ProcessAuthority, UnixAttributes};
+
+    #[derive(Clone)]
+    struct AllMountsStorage;
+    impl crate::Storage for AllMountsStorage {
+        type HostShare = MemoryHostFileSystem;
+        type Disk = MemoryDisk;
+    }
+
+    struct RawBytes(alloc::vec::Vec<u8>);
+    impl helios_btrfs::BlockSource for RawBytes {
+        fn size_bytes(&self) -> u64 {
+            self.0.len() as u64
+        }
+        async fn read_at(&self, offset: u64, out: &mut [u8]) -> helios_hal::io::IoResult<()> {
+            let start = offset as usize;
+            out.copy_from_slice(&self.0[start..start + out.len()]);
+            Ok(())
+        }
+    }
+
+    const BTRFS_BYTES: usize = 128 << 20;
+    const PARENTS: [(&str, u16, u32, u32); 3] = [
+        ("sgid", 0o2775, 1000, 100),
+        ("sticky", 0o1777, 0, 0),
+        ("locked", 0o0000, 999, 999),
+    ];
+
+    let stamp = BtrfsStamp::from_secs(1_700_000_000);
+    let mut btrfs_tree = TreeBuilder::new().root(BtrfsSeedMeta::new(0o755, stamp));
+    for (name, mode, uid, gid) in PARENTS {
+        btrfs_tree = btrfs_tree.directory(
+            alloc::format!("/{name}"),
+            BtrfsSeedMeta::new(mode, stamp).owned_by(uid, gid),
+        );
+    }
+    let mut image = tempfile::tempfile().expect("image file");
+    image.set_len(BTRFS_BYTES as u64).unwrap();
+    format_to(
+        &mut image,
+        btrfs_tree,
+        BTRFS_BYTES as u64,
+        FormatOptions::new([0x71; 16], stamp),
+    )
+    .unwrap();
+    image.seek(SeekFrom::Start(0)).unwrap();
+    let mut raw_btrfs = alloc::vec::Vec::new();
+    image.read_to_end(&mut raw_btrfs).unwrap();
+    let btrfs_disk = MemoryDisk::holding_writable("wasi-btrfs", &raw_btrfs);
+    let btrfs_cache = cache_over(&btrfs_disk, 256, 1);
+
+    let namespace: Namespace<AllMountsStorage> = Namespace::new(MountTable::new(
+        crate::BootFs::new(EmbeddedBootFs::empty(), BOOT_DEVICE),
+        1,
+    ));
+    let root_upper = namespace.root().upper().clone();
+    let mem_fs = MemoryFs::new(namespace.table().allocate_device());
+    let host_fs = MemoryHostFileSystem::new(namespace.table().allocate_device());
+
+    for fs in [&root_upper, &mem_fs, &host_fs.inner] {
+        for (name, mode, uid, gid) in PARENTS {
+            fs.create_directory_with(
+                FsPath::new(name).unwrap(),
+                UnixAttributes {
+                    permissions: u32::from(mode),
+                    uid,
+                    gid,
+                },
+                10,
+            )
+            .unwrap();
+        }
+    }
+    // Seed a `0000` file with an ACL on `/mem` to verify WASI ignores both:
+    // the mount's rights alone grant or refuse access.
+    mem_fs
+        .create_file_with(
+            FsPath::new("locked/secret").unwrap(),
+            UnixAttributes {
+                permissions: 0o0000,
+                uid: 999,
+                gid: 999,
+            },
+            10,
+        )
+        .unwrap();
+    mem_fs
+        .set_xattr(
+            FsPath::new("locked/secret").unwrap(),
+            "system.posix_acl_access",
+            Bytes::from_static(&[2, 0, 0, 0]),
+            crate::XattrSetMode::Create,
+            10,
+        )
+        .unwrap();
+
+    let authority = ProcessAuthority::root();
+    block_on(namespace.mount(
+        &authority.derive_mount_cap("/mem").unwrap(),
+        MountedFs::Memory(mem_fs.clone()),
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .unwrap();
+    block_on(namespace.mount(
+        &authority.derive_mount_cap("/host").unwrap(),
+        MountedFs::Host(HostShare::new(host_fs.clone())),
+        granted(FileSystemRights::READ | FileSystemRights::WRITE),
+    ))
+    .unwrap();
+
+    let timer = crate::test_support::test_timer(crate::test_support::TestCpu::without_entropy());
+    block_on(async {
+        let (btrfs_fs, btrfs_service) = BtrfsFs::mount_writable(
+            btrfs_cache.disk(0),
+            || DeviceId::new(220),
+            BtrfsWriteOptions {
+                entropy: crate::test_support::test_root_entropy(),
+                concurrency: NonZeroUsize::new(1).unwrap(),
+                compress: None,
+                commit: None,
+            },
+        )
+        .await
+        .unwrap();
+        namespace
+            .mount(
+                &authority.derive_mount_cap("/btrfs").unwrap(),
+                MountedFs::Btrfs(btrfs_fs.clone()),
+                granted(FileSystemRights::READ | FileSystemRights::WRITE),
+            )
+            .await
+            .unwrap();
+
+        let client = async {
+            // Even with mode 0000, uid 999 and an ACL, WASI opens and writes
+            // the file on a read-write mount.
+            let secret = open_at(
+                &namespace,
+                held(&root()),
+                fs_types::PathFlags::empty(),
+                "mem/locked/secret",
+                fs_types::OpenFlags::empty(),
+                FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+                20,
+            )
+            .await
+            .expect("WASI ignores stored Unix mode and ACLs");
+            write(&namespace, held(&secret), 0, b"granted-by-mount", 21)
+                .await
+                .expect("WASI writes through mount rights");
+            assert_eq!(
+                read(&namespace, held(&secret), 0, 64)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                b"granted-by-mount"
+            );
+            drop(secret);
+
+            // Create a regular file, a directory and a symlink through WASI
+            // under each parent across every writable filesystem.
+            for prefix in ["", "mem/", "host/", "btrfs/"] {
+                for (parent, ..) in PARENTS {
+                    let base = alloc::format!("{prefix}{parent}");
+                    open_at(
+                        &namespace,
+                        held(&root()),
+                        fs_types::PathFlags::empty(),
+                        &alloc::format!("{base}/file"),
+                        fs_types::OpenFlags::CREATE | fs_types::OpenFlags::EXCLUSIVE,
+                        FsDescriptorFlags::READ | FsDescriptorFlags::WRITE,
+                        30,
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("WASI create file in {base}: {err:?}"));
+                    create_directory_at(
+                        &namespace,
+                        held(&root()),
+                        &alloc::format!("{base}/dir"),
+                        30,
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("WASI create dir in {base}: {err:?}"));
+                    symlink_at(
+                        &namespace,
+                        held(&root()),
+                        "file",
+                        &alloc::format!("{base}/link"),
+                        30,
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("WASI symlink in {base}: {err:?}"));
+                }
+            }
+            namespace
+                .unmount(&authority.derive_mount_cap("/btrfs").unwrap())
+                .await
+                .unwrap();
+            btrfs_fs.unmount().await;
+            drop(btrfs_fs);
+        };
+        futures::future::join(client, btrfs_service.run(timer)).await;
+    });
+
+    for (label, fs) in [
+        ("root", &root_upper),
+        ("memory", &mem_fs),
+        ("host", &host_fs.inner),
+    ] {
+        for (parent, mode, uid, gid) in PARENTS {
+            let mode = u32::from(mode);
+            let check = |leaf: &str, expected: u32| {
+                let path = alloc::format!("{parent}/{leaf}");
+                assert_eq!(
+                    fs.unix_metadata(FsPath::new(&path).unwrap())
+                        .unwrap()
+                        .attributes,
+                    UnixAttributes {
+                        permissions: expected,
+                        uid,
+                        gid,
+                    },
+                    "{label}:{path}"
+                );
+            };
+            check("file", mode & 0o666);
+            check("dir", mode & 0o2777);
+            check("link", 0o777);
+        }
+    }
+
+    let btrfs_view = block_on(helios_btrfs::Filesystem::mount(RawBytes(
+        btrfs_disk.bytes_at(0, BTRFS_BYTES),
+    )))
+    .unwrap();
+    for (parent, mode, uid, gid) in PARENTS {
+        let mode = u32::from(mode);
+        let dir_inode =
+            block_on(btrfs_view.resolve(alloc::format!("/{parent}").as_bytes())).unwrap();
+        for (leaf, expected) in [
+            ("file", mode & 0o666),
+            ("dir", mode & 0o2777),
+            ("link", 0o777),
+        ] {
+            let inode = block_on(btrfs_view.lookup(&dir_inode, leaf.as_bytes()))
+                .unwrap()
+                .unwrap();
+            let meta = *inode.metadata();
+            assert_eq!(
+                (meta.permissions, meta.uid, meta.gid),
+                (expected, uid, gid),
+                "btrfs:{parent}/{leaf}"
+            );
+        }
     }
 }

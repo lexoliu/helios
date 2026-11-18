@@ -37,7 +37,7 @@ pub use crate::compress::write::{EncodeError, Encoded, Encoder, Lzo, Plain, Zlib
 pub use crate::free_space::FreeSpaceDefect;
 pub use crate::fs::writer::{
     Attributes, CloneRange, DEFAULT_DIRTY_METADATA_LIMIT, Dirty, InodeHandle, Name, RootUuids,
-    Usage, WriteTransaction, Writer,
+    Special, Usage, WriteTransaction, Writer,
 };
 pub use crate::space::{SpaceDefect, SpaceError};
 pub use crate::transaction::chunks::ChunkError;

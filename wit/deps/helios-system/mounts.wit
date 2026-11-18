@@ -23,6 +23,23 @@ interface mounts {
     btrfs(string),
   }
 
+  /// Whether a mount belongs to one container or may be seen by many,
+  /// fixed for as long as the mount exists. For a WASI or WASIX program
+  /// the two are the same: the mount's rights are all it holds, and it
+  /// sees no owner, group or mode.
+  enum mount-sharing {
+    /// The mount belongs to one container, which sees the ownership,
+    /// modes, set-id bits and file capabilities the filesystem stores and
+    /// is held to them within the mount's rights.
+    private,
+    /// The mount may be granted to several containers and to WASI programs
+    /// at once. In each container every node appears owned by the identity
+    /// the container's configuration names, its modes follow the mount's
+    /// rights, and the mount is nosuid and nodev, with file capabilities
+    /// ignored.
+    shared,
+  }
+
   record mount-request {
     source: mount-source,
     /// Directory path in the caller authority to attach the filesystem
@@ -30,6 +47,8 @@ interface mounts {
     path: string,
     /// Attach for reading only.
     read-only: bool,
+    /// Whether the mount is private or shared.
+    sharing: mount-sharing,
     /// The value of Linux's `compress=` mount option, such as `zstd:3`,
     /// `zlib`, `lzo` or `no`: the compression new data of a writable btrfs
     /// mount is written with. Absent writes uncompressed. A source other than

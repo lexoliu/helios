@@ -14,6 +14,7 @@ use crate::{
     StatsSample, TraceEvent, TraceFilter, TraceLog,
 };
 use crate::{MachineGeneration, MachineGenerationHandle, RootEntropy, RootEntropyHandle};
+use crate::{MountGrant, MountSharing};
 use helios_hal::cpu::{HardwarePerfCounterDelta, Timebase};
 use helios_hal::fs::FileSystemRights;
 use helios_hal::rtc::{RealTimeClock, UnixSeconds};
@@ -1034,7 +1035,11 @@ where
             .mount(
                 HOST_SHARE_GUEST_MOUNT_PATH,
                 MountedFs::Host(HostShare::new(service)),
-                FileSystemRights::READ | FileSystemRights::WRITE,
+                // The host's files, seen by every program the kernel runs.
+                MountGrant {
+                    rights: FileSystemRights::READ | FileSystemRights::WRITE,
+                    sharing: MountSharing::Shared,
+                },
             )
             .unwrap_or_else(|error| panic!("host share mount failed at bring-up: {error}"));
     }

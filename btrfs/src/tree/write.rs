@@ -20,10 +20,6 @@ use crate::{ChecksumType, Error, Key};
 pub enum WriteError {
     #[error("creation permissions {permissions:#o} include bits outside 07777")]
     InvalidPermissions { permissions: u32 },
-    /// A file never carries set-id authority (lexoliu/helios#1037); callers
-    /// answer it as not permitted.
-    #[error("permissions {permissions:#o} give a non-directory the setuid or setgid bit")]
-    SetId { permissions: u32 },
     #[error("inode handle belongs to another mount")]
     ForeignHandle,
     #[error("inode {inode} in tree {tree} no longer has generation {generation}")]

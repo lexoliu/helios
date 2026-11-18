@@ -80,9 +80,9 @@ use triomphe::Arc;
 
 use super::cache::{CachedAttributes, HostFsCache, HostFsCacheStats, PooledReadFid};
 use crate::{
-    AuthorityDomain, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError,
-    HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, Notify, ObjectIdentity,
-    ProfileSink, RawMutex,
+    AuthorityDomain, HostCreation, HostDirEntry, HostDirLimit, HostFileSystem, HostFilledWrite,
+    HostFsError, HostFsErrorKind, HostMetadata, HostShareRestore, HostWrite, Notify,
+    ObjectIdentity, ProfileSink, RawMutex,
 };
 
 /// The msize this client asks for. The server answers with its own
@@ -150,7 +150,10 @@ const P9_TWALK_FIXED_LEN: usize = P9_HEADER_LEN + 4 + 4 + 2;
 const P9_RGETATTR_QID_TYPE: usize = 15;
 const P9_RGETATTR_QID_PATH: usize = 20;
 const P9_RGETATTR_MODE: usize = 28;
+const P9_RGETATTR_UID: usize = 32;
+const P9_RGETATTR_GID: usize = 36;
 const P9_RGETATTR_NLINK: usize = 40;
+const P9_RGETATTR_RDEV: usize = 48;
 const P9_RGETATTR_SIZE: usize = 56;
 const P9_RGETATTR_ATIME_SECONDS: usize = 80;
 const P9_RGETATTR_MTIME_SECONDS: usize = 96;
@@ -1699,7 +1702,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         data
     }
 
-    async fn create_directory_impl(&self, path: &str) -> Result<(), HostFsError> {
+    async fn create_directory_impl(
+        &self,
+        path: &str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let session = self.session().await?;
         let name = session.string(name)?;
@@ -1711,8 +1718,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                 |body| {
                     push_u32(body, fid);
                     push_string(body, name);
-                    push_u32(body, 0o755);
-                    push_u32(body, P9_NOUID);
+                    push_u32(body, creation.permissions);
+                    push_u32(body, creation.gid);
                 },
                 P9_SMALL_REPLY_LEN,
             )
@@ -1723,7 +1730,11 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         result
     }
 
-    async fn create_file_impl(&self, path: &str) -> Result<(), HostFsError> {
+    async fn create_file_impl(
+        &self,
+        path: &str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(path)?;
         let session = self.session().await?;
         let name = session.string(name)?;
@@ -1736,8 +1747,8 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                     push_u32(body, fid);
                     push_string(body, name);
                     push_u32(body, P9_DOTL_WRONLY);
-                    push_u32(body, 0o644);
-                    push_u32(body, P9_NOUID);
+                    push_u32(body, creation.permissions);
+                    push_u32(body, creation.gid);
                 },
                 P9_SMALL_REPLY_LEN,
             )
@@ -1945,7 +1956,12 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
         result
     }
 
-    async fn symlink_impl(&self, target: &str, link_path: &str) -> Result<(), HostFsError> {
+    async fn symlink_impl(
+        &self,
+        target: &str,
+        link_path: &str,
+        gid: u32,
+    ) -> Result<(), HostFsError> {
         let (parent, name) = split_parent_name(link_path)?;
         let session = self.session().await?;
         let name = session.string(name)?;
@@ -1959,7 +1975,7 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFsClient<Transport, C
                     push_u32(body, fid);
                     push_string(body, name);
                     push_string(body, target);
-                    push_u32(body, P9_NOUID);
+                    push_u32(body, gid);
                 },
                 P9_SMALL_REPLY_LEN,
             )
@@ -2091,14 +2107,30 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         .await
     }
 
-    async fn create_file<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.profiled("op-create-file", self.create_file_impl(path), |_| 0)
-            .await
+    async fn create_file<'a>(
+        &'a self,
+        path: &'a str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
+        self.profiled(
+            "op-create-file",
+            self.create_file_impl(path, creation),
+            |_| 0,
+        )
+        .await
     }
 
-    async fn create_directory<'a>(&'a self, path: &'a str) -> Result<(), HostFsError> {
-        self.profiled("op-create-dir", self.create_directory_impl(path), |_| 0)
-            .await
+    async fn create_directory<'a>(
+        &'a self,
+        path: &'a str,
+        creation: HostCreation,
+    ) -> Result<(), HostFsError> {
+        self.profiled(
+            "op-create-dir",
+            self.create_directory_impl(path, creation),
+            |_| 0,
+        )
+        .await
     }
 
     async fn remove<'a>(&'a self, path: &'a str, directory: bool) -> Result<(), HostFsError> {
@@ -2128,9 +2160,18 @@ impl<Transport: HostFsTransport, CpuImpl: Cpu + Clone> HostFileSystem
         .await
     }
 
-    async fn symlink<'a>(&'a self, target: &'a str, link_path: &'a str) -> Result<(), HostFsError> {
-        self.profiled("op-symlink", self.symlink_impl(target, link_path), |_| 0)
-            .await
+    async fn symlink<'a>(
+        &'a self,
+        target: &'a str,
+        link_path: &'a str,
+        gid: u32,
+    ) -> Result<(), HostFsError> {
+        self.profiled(
+            "op-symlink",
+            self.symlink_impl(target, link_path, gid),
+            |_| 0,
+        )
+        .await
     }
 
     async fn read_link<'a>(&'a self, path: &'a str) -> Result<String, HostFsError> {
@@ -2564,7 +2605,10 @@ fn parse_getattr_reply(response: &[u8]) -> Result<HostMetadata, HostFsError> {
     let qid_type = read_u8(response, P9_RGETATTR_QID_TYPE)?;
     let qid_path = read_u64_le(response, P9_RGETATTR_QID_PATH)?;
     let mode = read_u32_le(response, P9_RGETATTR_MODE)?;
+    let uid = read_u32_le(response, P9_RGETATTR_UID)?;
+    let gid = read_u32_le(response, P9_RGETATTR_GID)?;
     let link_count = read_u64_le(response, P9_RGETATTR_NLINK)?;
+    let rdev = read_u64_le(response, P9_RGETATTR_RDEV)?;
     let size = read_u64_le(response, P9_RGETATTR_SIZE)?;
     let access_nanos = read_p9_timestamp(response, P9_RGETATTR_ATIME_SECONDS)?;
     let modified_nanos = read_p9_timestamp(response, P9_RGETATTR_MTIME_SECONDS)?;
@@ -2574,6 +2618,9 @@ fn parse_getattr_reply(response: &[u8]) -> Result<HostMetadata, HostFsError> {
         qid_path,
         qid_type,
         mode,
+        uid,
+        gid,
+        rdev,
         size,
         link_count,
         access_nanos,
@@ -2734,12 +2781,19 @@ mod tests {
 
     #[test]
     fn getattr_reply_reports_directory_qid_type() {
-        let reply = rgetattr_reply(P9_QTDIR, 7, 0o040_755, 2, 0, RgetattrTimes::ZERO);
+        let mut reply = rgetattr_reply(P9_QTDIR, 7, 0o040_755, 2, 0, RgetattrTimes::ZERO);
+        reply[P9_RGETATTR_UID..P9_RGETATTR_UID + 4].copy_from_slice(&1000_u32.to_le_bytes());
+        reply[P9_RGETATTR_GID..P9_RGETATTR_GID + 4].copy_from_slice(&100_u32.to_le_bytes());
+        reply[P9_RGETATTR_RDEV..P9_RGETATTR_RDEV + 8].copy_from_slice(&0x103_u64.to_le_bytes());
 
         let metadata = parse_getattr_reply(&reply).expect("Rgetattr reply should decode");
 
         assert_eq!(metadata.qid_type & P9_QTDIR, P9_QTDIR);
         assert_eq!(metadata.identity.local(), 7);
+        assert_eq!(
+            (metadata.mode, metadata.uid, metadata.gid, metadata.rdev),
+            (0o040_755, 1000, 100, 0x103)
+        );
     }
 
     #[test]
@@ -2857,6 +2911,8 @@ mod tests {
         walk_requests: Vec<(u32, u32, u16)>,
         /// `(fid, offset, payload)` of every `Twrite`, in arrival order.
         writes: Vec<(u32, u64, Vec<u8>)>,
+        /// The type and body of every `Tlcreate`, `Tmkdir` and `Tsymlink`.
+        creations: Vec<(u8, Vec<u8>)>,
     }
 
     impl ServerLog {
@@ -2932,6 +2988,9 @@ mod tests {
                 // is answered, so a request the fault injector refuses
                 // still shows up as one the client chose to send.
                 log.record(ty);
+                if matches!(ty, P9_TLCREATE | P9_TMKDIR | P9_TSYMLINK) {
+                    log.creations.push((ty, body.to_vec()));
+                }
             }
 
             let reply_tag = if self.inner.fault.corrupt_tag {
@@ -3612,16 +3671,16 @@ mod tests {
         // The name of a created file, a walked component, both names of
         // a rename and a symlink's target are all string fields.
         let results = [
-            block_on(client.create_file_impl(&alloc::format!("/dir/{too_long}"))),
-            block_on(client.create_directory_impl(&alloc::format!("/{too_long}"))),
+            block_on(client.create_file_impl(&alloc::format!("/dir/{too_long}"), CREATION)),
+            block_on(client.create_directory_impl(&alloc::format!("/{too_long}"), CREATION)),
             block_on(client.remove_impl(&alloc::format!("/{too_long}"), false)),
             block_on(client.stat_path_impl(&alloc::format!("/dir/{too_long}/leaf"))).map(|_| ()),
             block_on(client.rename_impl("/a", &alloc::format!("/{too_long}"))),
             block_on(client.rename_impl(&alloc::format!("/{too_long}/b"), "/a")),
             block_on(client.hard_link_impl("/a", &alloc::format!("/{too_long}"))),
             block_on(client.hard_link_impl(&alloc::format!("/{too_long}"), "/a")),
-            block_on(client.symlink_impl(&too_long, "/link")),
-            block_on(client.symlink_impl("/target", &alloc::format!("/{too_long}"))),
+            block_on(client.symlink_impl(&too_long, "/link", CREATION.gid)),
+            block_on(client.symlink_impl("/target", &alloc::format!("/{too_long}"), CREATION.gid)),
         ];
         for result in results {
             let error = result.expect_err("a 65536-byte name cannot be encoded");
@@ -3646,9 +3705,61 @@ mod tests {
         assert_eq!(client.inner.fids.live_count(), 1);
 
         // The longest name the format holds is still carried.
-        block_on(client.create_file_impl(&alloc::format!("/dir/{longest}")))
+        block_on(client.create_file_impl(&alloc::format!("/dir/{longest}"), CREATION))
             .expect("a 65535-byte name fits");
         assert!(transport.log().types.contains(&P9_TLCREATE));
+    }
+
+    /// The mode and group a creation is made with, as the parent's
+    /// inheritance gives them; the owner is the server's.
+    const CREATION: HostCreation = HostCreation {
+        permissions: 0o664,
+        gid: 1000,
+    };
+
+    #[test]
+    fn a_creation_carries_its_mode_and_group_to_the_host() {
+        let client = client(P9_REQUESTED_MSIZE, FakeFault::default());
+        let transport = client.inner.transport.clone();
+        let file = HostCreation {
+            permissions: 0o640,
+            gid: 100,
+        };
+        let directory = HostCreation {
+            permissions: 0o2775,
+            gid: 100,
+        };
+        block_on(async {
+            client
+                .create_file_impl("/中文/日本語のファイル", file)
+                .await
+                .expect("the file is created");
+            client
+                .create_directory_impl("/中文/한국어디렉터리", directory)
+                .await
+                .expect("the directory is created");
+            client
+                .symlink_impl("日本語のファイル", "/中文/링크", 100)
+                .await
+                .expect("the link is created");
+        });
+        let creations = transport.log().creations.clone();
+        let tail = |body: &[u8], words: usize| -> Vec<u32> {
+            body[body.len() - 4 * words..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect()
+        };
+        let types: Vec<u8> = creations.iter().map(|(ty, _)| *ty).collect();
+        assert_eq!(types, [P9_TLCREATE, P9_TMKDIR, P9_TSYMLINK]);
+        // Tlcreate: fid name[s] flags[4] mode[4] gid[4].
+        assert_eq!(tail(&creations[0].1, 3), [P9_DOTL_WRONLY, 0o640, 100]);
+        // Tmkdir: dfid name[s] mode[4] gid[4].
+        assert_eq!(tail(&creations[1].1, 2), [0o2775, 100]);
+        // Tsymlink: fid name[s] symtgt[s] gid[4].
+        assert_eq!(tail(&creations[2].1, 1), [100]);
     }
 
     #[test]
@@ -3657,16 +3768,17 @@ mod tests {
         let transport = client.inner.transport.clone();
         let longest = usize::from(max_string_len(P9_MIN_MSIZE));
 
-        let error =
-            block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest + 1))))
-                .expect_err("the request would not fit the msize");
+        let error = block_on(
+            client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest + 1)), CREATION),
+        )
+        .expect_err("the request would not fit the msize");
         assert!(
             matches!(error, HostFsError::NameTooLong { len, max_len } if len == longest + 1 && max_len == longest),
             "{error:?}"
         );
         assert!(!transport.log().types.contains(&P9_TLCREATE));
 
-        block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest))))
+        block_on(client.create_file_impl(&alloc::format!("/{}", "a".repeat(longest)), CREATION))
             .expect("the longest name the msize allows is carried");
         assert!(transport.log().types.contains(&P9_TLCREATE));
     }
@@ -4232,7 +4344,7 @@ mod tests {
                 .await
                 .expect("first listing");
             client
-                .create_file_impl("/alpha/beta")
+                .create_file_impl("/alpha/beta", CREATION)
                 .await
                 .expect("create the file");
             client

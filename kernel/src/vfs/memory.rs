@@ -29,6 +29,8 @@ use core::ops::Bound;
 
 use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
+use helios_btrfs::DeviceNumber;
+use helios_btrfs::write::Special;
 use helios_hal::fs::{
     DeviceId, DirCookie, DirEntry, FileSystem, FsError, FsPath, FsResult, Landed, Metadata, NodeId,
     NodeKind, OpenFlags, OwnedFsPath, PreparedWrite, RenameMode, WritePosition, WriteProgress,
@@ -36,9 +38,47 @@ use helios_hal::fs::{
 use spin::Mutex;
 use triomphe::Arc;
 
-use super::cmp_to_children;
+use super::{UnixAttributes, cmp_to_children};
 
 const ROOT_INODE: u64 = 1;
+const ROOT_UNIX: UnixAttributes = UnixAttributes {
+    permissions: 0o755,
+    uid: 0,
+    gid: 0,
+};
+/// Every bit `chmod` sets (`S_IALLUGO` in `include/linux/stat.h`).
+const S_IALLUGO: u32 = 0o7777;
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+/// `XATTR_NAME_MAX` and `XATTR_SIZE_MAX` in `include/uapi/linux/limits.h`.
+const XATTR_NAME_MAX: usize = 255;
+const XATTR_SIZE_MAX: usize = 65_536;
+
+/// The Unix metadata an inode of a [`MemoryFs`] stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryUnixMetadata {
+    pub kind: NodeKind,
+    pub attributes: UnixAttributes,
+    /// The device number a character or block device names; zero for
+    /// every other kind.
+    pub rdev: DeviceNumber,
+}
+
+/// How [`MemoryFs::set_xattr`] treats an attribute that already exists,
+/// matching `XATTR_CREATE` and `XATTR_REPLACE` in
+/// `include/uapi/linux/xattr.h`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XattrSetMode {
+    /// Create or replace (`flags == 0`).
+    #[default]
+    Any,
+    /// Fail with [`FsError::Exists`] when the attribute exists
+    /// (`XATTR_CREATE`).
+    Create,
+    /// Fail with [`FsError::NoEntry`] when the attribute is absent
+    /// (`XATTR_REPLACE`).
+    Replace,
+}
 
 /// A tree in kernel memory. Clones share the tree.
 #[derive(Clone)]
@@ -58,8 +98,11 @@ impl core::fmt::Debug for MemoryFs {
 
 struct Inode {
     kind: NodeKind,
+    unix: UnixAttributes,
+    rdev: DeviceNumber,
     /// A file's bytes or a symbolic link's target text.
     contents: Bytes,
+    xattrs: BTreeMap<String, Bytes>,
     link_count: u64,
     access_nanos: u64,
     modified_nanos: u64,
@@ -92,14 +135,18 @@ pub(super) struct UpperView {
 }
 
 impl MemoryFs {
-    /// An empty tree with only its root directory.
+    /// An empty tree with only its root directory (`0755`, owned by
+    /// `0:0`, as `RAMFS_DEFAULT_MODE` in `fs/ramfs/inode.c`).
     pub fn new(device: DeviceId) -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(
             ROOT_INODE,
             Inode {
                 kind: NodeKind::Directory,
+                unix: ROOT_UNIX,
+                rdev: DeviceNumber::default(),
                 contents: Bytes::new(),
+                xattrs: BTreeMap::new(),
                 link_count: 1,
                 access_nanos: 0,
                 modified_nanos: 0,
@@ -147,15 +194,16 @@ impl MemoryFs {
     }
 
     /// Copies an object of the layer below up to `path`, keeping its
-    /// times: `contents` is a file's bytes or a link's target, and empty
-    /// for a directory, which stays merging. When the tree has an object
-    /// there already, another copy-up won and this one does nothing; when
-    /// the layer below no longer shows there, the object was removed
-    /// meanwhile: [`FsError::NoEntry`].
+    /// times and Unix attributes: `contents` is a file's bytes or a link's
+    /// target, and empty for a directory, which stays merging. When the
+    /// tree has an object there already, another copy-up won and this one
+    /// does nothing; when the layer below no longer shows there, the
+    /// object was removed meanwhile: [`FsError::NoEntry`].
     pub(super) fn copy_up(
         &self,
         path: FsPath<'_>,
         kind: NodeKind,
+        unix: UnixAttributes,
         contents: Bytes,
         original: &Metadata,
     ) -> FsResult<()> {
@@ -167,7 +215,14 @@ impl MemoryFs {
             return Err(FsError::NoEntry);
         }
         state.require_new_name(path)?;
-        let number = state.insert(path, kind, contents, original.modified_nanos);
+        let number = state.insert(
+            path,
+            kind,
+            unix,
+            DeviceNumber::default(),
+            contents,
+            original.modified_nanos,
+        );
         let inode = state
             .inodes
             .get_mut(&number)
@@ -175,6 +230,205 @@ impl MemoryFs {
         inode.access_nanos = original.access_nanos;
         inode.status_nanos = original.status_nanos;
         Ok(())
+    }
+
+    /// The Unix attributes and device number stored on the inode at
+    /// `path`.
+    pub fn unix_metadata(&self, path: FsPath<'_>) -> FsResult<MemoryUnixMetadata> {
+        let state = self.state.lock();
+        let (_, inode) = state.inode(path)?;
+        Ok(MemoryUnixMetadata {
+            kind: inode.kind,
+            attributes: inode.unix,
+            rdev: inode.rdev,
+        })
+    }
+
+    /// Creates a regular file at `path` with explicit Unix attributes,
+    /// keeping every bit of `07777` (the set-id and sticky bits included).
+    pub fn create_file_with(
+        &self,
+        path: FsPath<'_>,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<Metadata> {
+        validate_permissions(unix.permissions)?;
+        let mut state = self.state.lock();
+        state.require_new_name(path)?;
+        state.insert(
+            path,
+            NodeKind::File,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
+        state.metadata(self.device, path)
+    }
+
+    /// Creates a directory at `path` with explicit Unix attributes,
+    /// keeping every bit of `07777` (the set-id and sticky bits included).
+    pub fn create_directory_with(
+        &self,
+        path: FsPath<'_>,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<()> {
+        validate_permissions(unix.permissions)?;
+        let mut state = self.state.lock();
+        state.require_new_name(path)?;
+        state.insert(
+            path,
+            NodeKind::Directory,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
+        Ok(())
+    }
+
+    /// Creates a symbolic link at `link` to `target` with explicit Unix
+    /// attributes.
+    pub fn symlink_with(
+        &self,
+        target: &str,
+        link: FsPath<'_>,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<()> {
+        validate_permissions(unix.permissions)?;
+        let mut state = self.state.lock();
+        state.require_new_name(link)?;
+        state.insert(
+            link,
+            NodeKind::Symlink,
+            unix,
+            DeviceNumber::default(),
+            Bytes::copy_from_slice(target.as_bytes()),
+            now,
+        );
+        Ok(())
+    }
+
+    /// Creates a device node, a FIFO or a socket at `path`, as
+    /// `shmem_mknod` in `mm/shmem.c`.
+    pub fn create_special(
+        &self,
+        path: FsPath<'_>,
+        special: Special,
+        unix: UnixAttributes,
+        now: u64,
+    ) -> FsResult<()> {
+        validate_permissions(unix.permissions)?;
+        let (kind, rdev) = match special {
+            Special::CharDevice(device) => (NodeKind::CharacterDevice, device),
+            Special::BlockDevice(device) => (NodeKind::BlockDevice, device),
+            Special::Fifo => (NodeKind::Fifo, DeviceNumber::default()),
+            Special::Socket => (NodeKind::Socket, DeviceNumber::default()),
+        };
+        let mut state = self.state.lock();
+        state.require_new_name(path)?;
+        state.insert(path, kind, unix, rdev, Bytes::new(), now);
+        Ok(())
+    }
+
+    /// Replaces the permission, set-id and sticky bits (`07777`) of the
+    /// inode at `path`, keeping them on every kind of inode as Linux's
+    /// storage does (`chmod_common` in `fs/open.c`).
+    pub fn set_permissions(&self, path: FsPath<'_>, permissions: u32, now: u64) -> FsResult<()> {
+        validate_permissions(permissions)?;
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        inode.unix.permissions = permissions;
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    /// Sets the owner and/or the group of the inode at `path`, leaving
+    /// either alone when `None`. On a non-directory, the set-id bits and
+    /// `security.capability` are dropped (`chown_common` in `fs/open.c`
+    /// with `ATTR_KILL_SUID | ATTR_KILL_SGID | ATTR_KILL_PRIV`).
+    pub fn set_owner(
+        &self,
+        path: FsPath<'_>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        now: u64,
+    ) -> FsResult<()> {
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        if let Some(uid) = uid {
+            inode.unix.uid = uid;
+        }
+        if let Some(gid) = gid {
+            inode.unix.gid = gid;
+        }
+        if inode.kind != NodeKind::Directory {
+            inode.unix.permissions &= !(S_ISUID | S_ISGID);
+            inode.xattrs.remove("security.capability");
+        }
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    /// Reads the extended attribute `name` on the inode at `path`, or
+    /// `Ok(None)` when that attribute is not set.
+    pub fn xattr(&self, path: FsPath<'_>, name: &str) -> FsResult<Option<Bytes>> {
+        let state = self.state.lock();
+        let (_, inode) = state.inode(path)?;
+        validate_xattr_name(inode.kind, name, false)?;
+        Ok(inode.xattrs.get(name).cloned())
+    }
+
+    /// Lists every extended attribute name stored on the inode at `path`,
+    /// in lexicographic order.
+    pub fn list_xattrs(&self, path: FsPath<'_>) -> FsResult<Vec<String>> {
+        let state = self.state.lock();
+        let (_, inode) = state.inode(path)?;
+        Ok(inode.xattrs.keys().cloned().collect())
+    }
+
+    /// Sets the extended attribute `name` on the inode at `path`, in the
+    /// `user.*`, `security.*`, `trusted.*` and `system.posix_acl_*`
+    /// namespaces of `shmem_xattr_handlers` in `mm/shmem.c`, with no
+    /// policy refusal of what an attribute would mean.
+    pub fn set_xattr(
+        &self,
+        path: FsPath<'_>,
+        name: &str,
+        value: Bytes,
+        mode: XattrSetMode,
+        now: u64,
+    ) -> FsResult<()> {
+        if value.len() > XATTR_SIZE_MAX {
+            return Err(FsError::Overflow);
+        }
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, true)?;
+        let exists = inode.xattrs.contains_key(name);
+        match (mode, exists) {
+            (XattrSetMode::Create, true) => return Err(FsError::Exists),
+            (XattrSetMode::Replace, false) => return Err(FsError::NoEntry),
+            _ => {}
+        }
+        inode.xattrs.insert(String::from(name), value);
+        inode.status_nanos = now;
+        Ok(())
+    }
+
+    /// Removes the extended attribute `name` from the inode at `path`,
+    /// returning whether it was present.
+    pub fn remove_xattr(&self, path: FsPath<'_>, name: &str, now: u64) -> FsResult<bool> {
+        let mut state = self.state.lock();
+        let inode = state.inode_mut(path)?;
+        validate_xattr_name(inode.kind, name, false)?;
+        let removed = inode.xattrs.remove(name).is_some();
+        if removed {
+            inode.status_nanos = now;
+        }
+        Ok(removed)
     }
 
     /// Removes the object at `path` (a directory when `directory`, which
@@ -294,6 +548,58 @@ impl MemoryFs {
         }
         Ok(())
     }
+}
+
+/// Validates `permissions` against `07777` (`S_IALLUGO`).
+fn validate_permissions(permissions: u32) -> FsResult<()> {
+    if permissions & !S_IALLUGO != 0 {
+        return Err(FsError::Invalid);
+    }
+    Ok(())
+}
+
+/// Validates an extended attribute name against Linux's tmpfs handlers
+/// (`shmem_xattr_handlers` in `mm/shmem.c`, `xattr_resolve_name` and
+/// `xattr_permission` in `fs/xattr.c`, and `posix_acl_xattr_set` in
+/// `fs/posix_acl.c`). No attribute is refused for what its value means.
+fn validate_xattr_name(kind: NodeKind, name: &str, writing: bool) -> FsResult<()> {
+    if name.is_empty() || name.len() > XATTR_NAME_MAX {
+        return Err(FsError::Overflow);
+    }
+    if let Some(suffix) = name.strip_prefix("user.") {
+        if suffix.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        if !matches!(kind, NodeKind::File | NodeKind::Directory) {
+            return Err(FsError::NotPermitted);
+        }
+        return Ok(());
+    }
+    if let Some(suffix) = name
+        .strip_prefix("security.")
+        .or_else(|| name.strip_prefix("trusted."))
+    {
+        if suffix.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        return Ok(());
+    }
+    if name == "system.posix_acl_access" {
+        if kind == NodeKind::Symlink {
+            return Err(FsError::Unsupported);
+        }
+        return Ok(());
+    }
+    if name == "system.posix_acl_default" {
+        if kind == NodeKind::Symlink {
+            return Err(FsError::Unsupported);
+        }
+        if writing && kind != NodeKind::Directory {
+            return Err(FsError::NotPermitted);
+        }
+        return Ok(());
+    }
+    Err(FsError::Unsupported)
 }
 
 /// `name`, which is `from` or lies below it, moved to the same place
@@ -436,14 +742,32 @@ impl MemoryState {
         }
     }
 
-    fn insert(&mut self, path: FsPath<'_>, kind: NodeKind, contents: Bytes, now: u64) -> u64 {
+    /// The Unix attributes a node of `kind` at `path` inherits from its
+    /// parent directory when created without a caller identity.
+    fn inherited_unix(&self, path: FsPath<'_>, kind: NodeKind) -> FsResult<UnixAttributes> {
+        let (parent, _) = path.split_last().ok_or(FsError::Exists)?;
+        Ok(self.inode(parent)?.1.unix.inherited(kind))
+    }
+
+    fn insert(
+        &mut self,
+        path: FsPath<'_>,
+        kind: NodeKind,
+        unix: UnixAttributes,
+        rdev: DeviceNumber,
+        contents: Bytes,
+        now: u64,
+    ) -> u64 {
         let number = self.next_inode;
         self.next_inode += 1;
         self.inodes.insert(
             number,
             Inode {
                 kind,
+                unix,
+                rdev,
                 contents,
+                xattrs: BTreeMap::new(),
                 link_count: 1,
                 access_nanos: now,
                 modified_nanos: now,
@@ -679,6 +1003,9 @@ impl FileSystem for MemoryFs {
                 if flags.contains(OpenFlags::CREATE | OpenFlags::EXCLUSIVE) {
                     return Err(FsError::Exists);
                 }
+                if let Some(refusal) = inode.kind.open_refusal() {
+                    return Err(refusal);
+                }
                 if flags.contains(OpenFlags::DIRECTORY) && inode.kind != NodeKind::Directory {
                     return Err(FsError::NotDirectory);
                 }
@@ -694,7 +1021,15 @@ impl FileSystem for MemoryFs {
                     return Err(FsError::Invalid);
                 }
                 state.require_new_name(path)?;
-                state.insert(path, NodeKind::File, Bytes::new(), now);
+                let unix = state.inherited_unix(path, NodeKind::File)?;
+                state.insert(
+                    path,
+                    NodeKind::File,
+                    unix,
+                    DeviceNumber::default(),
+                    Bytes::new(),
+                    now,
+                );
             }
             Err(error) => return Err(error),
         }
@@ -780,7 +1115,15 @@ impl FileSystem for MemoryFs {
     async fn create_directory(&self, path: FsPath<'_>, now: u64) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(path)?;
-        state.insert(path, NodeKind::Directory, Bytes::new(), now);
+        let unix = state.inherited_unix(path, NodeKind::Directory)?;
+        state.insert(
+            path,
+            NodeKind::Directory,
+            unix,
+            DeviceNumber::default(),
+            Bytes::new(),
+            now,
+        );
         Ok(())
     }
 
@@ -823,9 +1166,12 @@ impl FileSystem for MemoryFs {
     async fn symlink(&self, target: &str, link: FsPath<'_>, now: u64) -> FsResult<()> {
         let mut state = self.state.lock();
         state.require_new_name(link)?;
+        let unix = state.inherited_unix(link, NodeKind::Symlink)?;
         state.insert(
             link,
             NodeKind::Symlink,
+            unix,
+            DeviceNumber::default(),
             Bytes::copy_from_slice(target.as_bytes()),
             now,
         );
@@ -1165,5 +1511,295 @@ mod tests {
         assert_eq!(rest.len(), 2);
         assert_eq!(rest[1].kind, NodeKind::Symlink);
         assert_eq!(block_on(fs.read_link(path("l"))).as_deref(), Ok("a"));
+    }
+
+    #[test]
+    fn a_node_created_without_an_identity_inherits_from_its_parent() {
+        use crate::UnixAttributes;
+
+        let fs = tree();
+        let directories = [
+            ("中文目录", 0o2775, 1000, 100),
+            ("日本語のディレクトリ", 0o1777, 0, 0),
+            ("한국어디렉터리", 0o4750, 7, 8),
+        ];
+        for (name, permissions, uid, gid) in directories {
+            fs.create_directory_with(
+                path(name),
+                UnixAttributes {
+                    permissions,
+                    uid,
+                    gid,
+                },
+                10,
+            )
+            .expect("creates directory");
+            let file = alloc::format!("{name}/ファイル");
+            block_on(fs.open(path(&file), OpenFlags::CREATE, 20)).expect("creates file");
+            let child = alloc::format!("{name}/하위");
+            block_on(fs.create_directory(path(&child), 20)).expect("creates subdirectory");
+            let link = alloc::format!("{name}/链接");
+            block_on(fs.symlink("ファイル", path(&link), 20)).expect("creates symlink");
+
+            assert_eq!(
+                fs.unix_metadata(path(&file)).expect("file").attributes,
+                UnixAttributes {
+                    permissions: permissions & 0o666,
+                    uid,
+                    gid,
+                },
+                "{name}"
+            );
+            assert_eq!(
+                fs.unix_metadata(path(&child)).expect("child").attributes,
+                UnixAttributes {
+                    permissions: permissions & 0o2777,
+                    uid,
+                    gid,
+                },
+                "{name}"
+            );
+            assert_eq!(
+                fs.unix_metadata(path(&link)).expect("link").attributes,
+                UnixAttributes {
+                    permissions: 0o777,
+                    uid,
+                    gid,
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn stores_unix_authority_device_nodes_and_xattrs_as_linux_does() {
+        use bytes::Bytes;
+        use helios_btrfs::DeviceNumber;
+        use helios_btrfs::write::Special;
+
+        use super::XattrSetMode;
+        use crate::UnixAttributes;
+
+        let fs = tree();
+        let owner = |permissions| UnixAttributes {
+            permissions,
+            uid: 1000,
+            gid: 100,
+        };
+        assert_eq!(
+            fs.create_file_with(path("bad"), owner(0o100_644), 1)
+                .map(drop),
+            Err(FsError::Invalid)
+        );
+        fs.create_file_with(path("suid"), owner(0o4755), 1)
+            .expect("creates setuid file");
+        fs.create_directory_with(path("sgid"), owner(0o3775), 1)
+            .expect("creates setgid sticky directory");
+        fs.symlink_with("suid", path("link"), owner(0o777), 1)
+            .expect("creates symlink");
+
+        let null = DeviceNumber::new(1, 3).unwrap();
+        let wide = DeviceNumber::new(259, 0x1_2345).unwrap();
+        for (name, special, kind, expected_rdev, open_err) in [
+            (
+                "chr",
+                Special::CharDevice(null),
+                NodeKind::CharacterDevice,
+                null,
+                FsError::NotPermitted,
+            ),
+            (
+                "blk",
+                Special::BlockDevice(wide),
+                NodeKind::BlockDevice,
+                wide,
+                FsError::NotPermitted,
+            ),
+            (
+                "fifo",
+                Special::Fifo,
+                NodeKind::Fifo,
+                DeviceNumber::default(),
+                FsError::Unsupported,
+            ),
+            (
+                "sock",
+                Special::Socket,
+                NodeKind::Socket,
+                DeviceNumber::default(),
+                FsError::Unsupported,
+            ),
+        ] {
+            fs.create_special(path(name), special, owner(0o6640), 2)
+                .expect("creates special");
+            let meta = fs.unix_metadata(path(name)).expect("special metadata");
+            assert_eq!(meta.kind, kind, "{name}");
+            assert_eq!(meta.rdev, expected_rdev, "{name}");
+            assert_eq!(meta.attributes, owner(0o6640), "{name}");
+            assert_eq!(
+                block_on(fs.open(path(name), OpenFlags::empty(), 3)).map(drop),
+                Err(open_err),
+                "{name}"
+            );
+        }
+
+        // Extended attributes across every handler Linux's tmpfs keeps, with
+        // no policy refusal of `security.*`, `trusted.*` or POSIX ACLs.
+        for (attr, value) in [
+            ("user.comment", &b"hello"[..]),
+            ("security.capability", &[1, 0, 0, 2][..]),
+            ("trusted.overlay.opaque", b"y"),
+            ("system.posix_acl_access", &[2, 0, 0, 0][..]),
+        ] {
+            fs.set_xattr(
+                path("suid"),
+                attr,
+                Bytes::copy_from_slice(value),
+                XattrSetMode::Create,
+                4,
+            )
+            .expect(attr);
+            assert_eq!(
+                fs.set_xattr(
+                    path("suid"),
+                    attr,
+                    Bytes::from_static(b"dup"),
+                    XattrSetMode::Create,
+                    5,
+                ),
+                Err(FsError::Exists)
+            );
+        }
+        fs.set_xattr(
+            path("sgid"),
+            "system.posix_acl_default",
+            Bytes::from_static(&[2, 0, 0, 0]),
+            XattrSetMode::Any,
+            4,
+        )
+        .expect("default ACL on directory");
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "system.posix_acl_default",
+                Bytes::from_static(&[2, 0, 0, 0]),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::NotPermitted)
+        );
+        // `user.*` is refused on symlinks and special nodes (`xattr_permission`);
+        // `security.*` and `trusted.*` are kept on them.
+        assert_eq!(
+            fs.set_xattr(
+                path("chr"),
+                "user.label",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::NotPermitted)
+        );
+        fs.set_xattr(
+            path("chr"),
+            "security.selinux",
+            Bytes::from_static(b"system_u:object_r:null_device_t:s0"),
+            XattrSetMode::Any,
+            4,
+        )
+        .expect("security xattr on device node");
+        fs.set_xattr(
+            path("link"),
+            "trusted.tag",
+            Bytes::from_static(b"kept"),
+            XattrSetMode::Any,
+            4,
+        )
+        .expect("trusted xattr on symlink");
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "other.ns",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Any,
+                4,
+            ),
+            Err(FsError::Unsupported)
+        );
+        assert_eq!(
+            fs.set_xattr(
+                path("suid"),
+                "user.missing",
+                Bytes::from_static(b"no"),
+                XattrSetMode::Replace,
+                4,
+            ),
+            Err(FsError::NoEntry)
+        );
+        assert_eq!(
+            fs.list_xattrs(path("suid")).unwrap(),
+            [
+                "security.capability",
+                "system.posix_acl_access",
+                "trusted.overlay.opaque",
+                "user.comment",
+            ]
+        );
+
+        // Unrelated writes, hard links and renames preserve stored metadata.
+        block_on(write_bytes(
+            &fs,
+            path("suid"),
+            WritePosition::At(0),
+            b"#!/bin/sh\n",
+            6,
+        ))
+        .expect("writes");
+        block_on(fs.link(path("suid"), path("suid-hard"), 7)).expect("links");
+        block_on(fs.rename(path("chr"), path("chr-moved"), RenameMode::Replace, 8))
+            .expect("renames device node");
+        assert_eq!(
+            fs.unix_metadata(path("suid-hard")).unwrap().attributes,
+            owner(0o4755)
+        );
+        assert_eq!(fs.unix_metadata(path("chr-moved")).unwrap().rdev, null);
+        assert_eq!(
+            fs.xattr(path("suid-hard"), "trusted.overlay.opaque")
+                .unwrap()
+                .as_deref(),
+            Some(&b"y"[..])
+        );
+
+        // chmod stores every bit of 07777; chown on a non-directory drops
+        // set-id bits and `security.capability`, while a directory keeps them.
+        fs.set_permissions(path("suid"), 0o6755, 9).expect("chmod");
+        assert_eq!(
+            fs.unix_metadata(path("suid")).unwrap().attributes,
+            owner(0o6755)
+        );
+        fs.set_owner(path("suid"), Some(0), Some(0), 10)
+            .expect("chown file");
+        assert_eq!(
+            fs.unix_metadata(path("suid")).unwrap().attributes,
+            UnixAttributes {
+                permissions: 0o755,
+                uid: 0,
+                gid: 0,
+            }
+        );
+        assert_eq!(fs.xattr(path("suid"), "security.capability").unwrap(), None);
+        assert!(fs.remove_xattr(path("suid"), "user.comment", 11).unwrap());
+        assert!(!fs.remove_xattr(path("suid"), "user.comment", 12).unwrap());
+
+        fs.set_owner(path("sgid"), Some(0), Some(200), 13)
+            .expect("chown directory");
+        assert_eq!(
+            fs.unix_metadata(path("sgid")).unwrap().attributes,
+            UnixAttributes {
+                permissions: 0o3775,
+                uid: 0,
+                gid: 200,
+            }
+        );
     }
 }

@@ -63,6 +63,7 @@ async fn create(
                 mode,
                 uid: 1000,
                 gid: 1000,
+                rdev: 0,
             },
             WHEN,
         )

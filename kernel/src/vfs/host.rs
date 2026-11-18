@@ -19,9 +19,10 @@ use helios_hal::fs::{
     NodeId, NodeKind, OpenFlags, PreparedWrite, RenameMode, WritePosition, WriteProgress,
 };
 
+use super::UnixAttributes;
 use crate::{
-    HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind, HostMetadata,
-    HostWrite,
+    HostCreation, HostDirLimit, HostFileSystem, HostFilledWrite, HostFsError, HostFsErrorKind,
+    HostMetadata, HostWrite,
 };
 
 /// The most of one host directory a listing holds in kernel memory.
@@ -54,6 +55,30 @@ impl<H> HostShare<H> {
 
 fn host_path(path: FsPath<'_>) -> &str {
     if path.is_root() { "/" } else { path.as_str() }
+}
+
+impl<H: HostFileSystem> HostShare<H> {
+    /// How a node of `kind` at `path` is made: a request reaching the
+    /// share carries no creator identity, so the node inherits its mode and
+    /// group from the directory it is made in ([`UnixAttributes::inherited`]).
+    async fn creation(&self, path: FsPath<'_>, kind: NodeKind) -> FsResult<HostCreation> {
+        let (parent, _) = path.split_last().ok_or(FsError::Exists)?;
+        let directory = self
+            .client
+            .stat_path(host_path(parent))
+            .await
+            .map_err(fs_error_from_host)?;
+        let node = UnixAttributes {
+            permissions: directory.mode & 0o7777,
+            uid: directory.uid,
+            gid: directory.gid,
+        }
+        .inherited(kind);
+        Ok(HostCreation {
+            permissions: node.permissions,
+            gid: node.gid,
+        })
+    }
 }
 
 pub(crate) fn fs_error_from_host(error: HostFsError) -> FsError {
@@ -175,8 +200,9 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
                 if flags.contains(OpenFlags::DIRECTORY) {
                     return Err(FsError::Invalid);
                 }
+                let creation = self.creation(path, NodeKind::File).await?;
                 self.client
-                    .create_file(host)
+                    .create_file(host, creation)
                     .await
                     .map_err(fs_error_from_host)?;
                 self.stat(path).await
@@ -272,8 +298,9 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
     }
 
     async fn create_directory(&self, path: FsPath<'_>, _now: u64) -> FsResult<()> {
+        let creation = self.creation(path, NodeKind::Directory).await?;
         self.client
-            .create_directory(host_path(path))
+            .create_directory(host_path(path), creation)
             .await
             .map_err(fs_error_from_host)
     }
@@ -321,8 +348,9 @@ impl<H: HostFileSystem> FileSystem for HostShare<H> {
     }
 
     async fn symlink(&self, target: &str, link: FsPath<'_>, _now: u64) -> FsResult<()> {
+        let creation = self.creation(link, NodeKind::Symlink).await?;
         self.client
-            .symlink(target, host_path(link))
+            .symlink(target, host_path(link), creation.gid)
             .await
             .map_err(fs_error_from_host)
     }
@@ -372,6 +400,9 @@ mod tests {
             qid_path: identity.local(),
             qid_type,
             mode,
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
             size: 17,
             link_count: 2,
             access_nanos: 3_000_000_004,

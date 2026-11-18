@@ -1197,6 +1197,12 @@ pub struct HostMetadata {
     pub qid_path: u64,
     pub qid_type: u8,
     pub mode: u32,
+    /// The owner and group the host reports (`Rgetattr.uid`, `.gid`).
+    pub uid: u32,
+    pub gid: u32,
+    /// The device number a character or block device node names
+    /// (`Rgetattr.rdev`); zero for every other kind.
+    pub rdev: u64,
     pub size: u64,
     /// Hard-link count reported by the host (`Rgetattr.nlink`).
     pub link_count: u64,
@@ -1206,6 +1212,18 @@ pub struct HostMetadata {
     pub modified_nanos: u64,
     /// Last status change time in nanoseconds since the Unix epoch.
     pub status_nanos: u64,
+}
+
+/// What a node created on the host share is made with: its permission bits
+/// and its group, the two a 9P2000.L creation carries (`Tlcreate` and
+/// `Tmkdir` take a mode and a gid, `Tsymlink` a gid). The owner is the
+/// server's to assign from the identity the session attached as, as it is
+/// for Linux's own 9p client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCreation {
+    /// The permission, set-id and sticky bits (`07777`).
+    pub permissions: u32,
+    pub gid: u32,
 }
 
 impl HostMetadata {
@@ -1503,13 +1521,17 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         access_nanos: Option<u64>,
         modified_nanos: Option<u64>,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the regular file `path`, made as `creation` says.
     fn create_file<'a>(
         &'a self,
         path: &'a str,
+        creation: HostCreation,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the directory `path`, made as `creation` says.
     fn create_directory<'a>(
         &'a self,
         path: &'a str,
+        creation: HostCreation,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn remove<'a>(
         &'a self,
@@ -1526,10 +1548,13 @@ pub trait HostFileSystem: Clone + Send + Sync + 'static {
         source: &'a str,
         destination: &'a str,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
+    /// Creates the symbolic link `link_path` to `target`, in group `gid`;
+    /// a link's mode is always `0777`.
     fn symlink<'a>(
         &'a self,
         target: &'a str,
         link_path: &'a str,
+        gid: u32,
     ) -> impl Future<Output = Result<(), HostFsError>> + Send + 'a;
     fn read_link<'a>(
         &'a self,

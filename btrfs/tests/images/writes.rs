@@ -397,7 +397,7 @@ struct Authority {
     permissions: u32,
     uid: u32,
     gid: u32,
-    rdev: u64,
+    rdev: helios_btrfs::DeviceNumber,
     nlink: u32,
     size: u64,
     ctime: Timestamp,
@@ -541,10 +541,15 @@ fn linux_authority_survives_unrelated_writes() {
             .unwrap();
     });
 
+    btrfs_check(&shared);
+}
+
+/// Copies the image to a file, which `btrfs check` must find clean.
+fn btrfs_check(image: &WritableImage) -> tempfile::NamedTempFile {
     let scratch = tempfile::NamedTempFile::new().unwrap();
     {
         use std::io::Seek;
-        let mut image = shared.0.lock().unwrap();
+        let mut image = image.0.lock().unwrap();
         image.seek(std::io::SeekFrom::Start(0)).unwrap();
         std::io::copy(&mut *image, &mut scratch.reopen().unwrap()).unwrap();
     }
@@ -559,4 +564,141 @@ fn linux_authority_survives_unrelated_writes() {
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
+    scratch
+}
+
+/// Helios sets and removes the Unix authority Linux stores (lexoliu/helios#1037):
+/// set-id and sticky bits by chmod and at creation, device nodes, FIFOs and
+/// sockets by mknod, and the set-id bits a chown drops. `btrfs check` is
+/// clean, and Linux's btrfs mounts the image and reads back what Helios
+/// wrote.
+#[test]
+#[ignore = "needs mkfs.btrfs and btrfs check from btrfs-progs, passwordless sudo, and a Linux kernel with btrfs to loop-mount; the Linux CI lane runs it with --run-ignored"]
+fn linux_reads_back_the_authority_helios_sets() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    use helios_btrfs::DeviceNumber;
+    use helios_btrfs::write::Special;
+
+    const NAMES: [&str; 3] = ["中文", "日本語", "한국어"];
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::write(tree.path().join("chmod-me"), b"#!/bin/sh\n").unwrap();
+    std::fs::write(tree.path().join("chown-me"), b"#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(
+        tree.path().join("chown-me"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o6755),
+    )
+    .unwrap();
+    let image = super::mkfs::mkfs_sized(tree.path(), 128 << 20, &[]);
+    let shared = std::sync::Arc::new(WritableImage(Mutex::new(image)));
+    let null = DeviceNumber::new(1, 3).unwrap();
+    let wide = DeviceNumber::new(259, 0x1_2345).unwrap();
+    let when = Timestamp {
+        seconds: 1_800_000_000,
+        nanoseconds: 0,
+    };
+    // What Linux must read back: name, file type and permission bits of
+    // `st_mode`, owner, group and `st_rdev`.
+    let mut expected: Vec<(String, u32, u32, u32, u64)> = Vec::new();
+    block_on(async {
+        let mut writer = Writer::mount(
+            SharedImage(shared.clone()),
+            no_uuid as fn() -> [u8; 16],
+            std::thread::available_parallelism().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut tx = writer.join().await.unwrap();
+        let root = tx.root().await.unwrap();
+        fn at<'a>(parent: &'a helios_btrfs::write::InodeHandle, name: &'a str) -> Name<'a> {
+            Name {
+                parent,
+                bytes: name.as_bytes(),
+            }
+        }
+        let chmod = tx.lookup(&root, b"chmod-me").await.unwrap().unwrap();
+        tx.set_permissions(&chmod, 0o7755, when).await.unwrap();
+        expected.push(("chmod-me".to_owned(), 0o107_755, 0, 0, 0));
+        let chown = tx.lookup(&root, b"chown-me").await.unwrap().unwrap();
+        tx.set_owner(&chown, Some(1000), Some(1000), when)
+            .await
+            .unwrap();
+        expected.push(("chown-me".to_owned(), 0o100_755, 1000, 1000, 0));
+        for name in NAMES {
+            let owner = |permissions| Attributes {
+                permissions,
+                uid: 1000,
+                gid: 100,
+            };
+            let file = format!("suid-{name}");
+            tx.create_file(at(&root, &file), owner(0o4755), when)
+                .await
+                .unwrap();
+            expected.push((file, 0o104_755, 1000, 100, 0));
+            let directory = format!("sgid-{name}");
+            tx.create_directory(at(&root, &directory), owner(0o3775), when)
+                .await
+                .unwrap();
+            expected.push((directory, 0o043_775, 1000, 100, 0));
+            for (prefix, special, mode, rdev) in [
+                ("chr", Special::CharDevice(null), 0o020_660, null),
+                ("blk", Special::BlockDevice(wide), 0o060_660, wide),
+                ("fifo", Special::Fifo, 0o010_660, DeviceNumber::default()),
+                ("sock", Special::Socket, 0o140_660, DeviceNumber::default()),
+            ] {
+                let node = format!("{prefix}-{name}");
+                tx.create_special(at(&root, &node), special, owner(0o660), when)
+                    .await
+                    .unwrap();
+                expected.push((node, mode, 1000, 100, u64::from(rdev.encode())));
+            }
+            // Made and removed again, as `rm` takes a node away.
+            let gone = format!("gone-{name}");
+            let device = Special::CharDevice(null);
+            tx.create_special(at(&root, &gone), device, owner(0o600), when)
+                .await
+                .unwrap();
+            tx.unlink_name(at(&root, &gone), when).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+    });
+
+    let image = btrfs_check(&shared);
+    let mount = tempfile::tempdir().unwrap();
+    let point = mount.path().to_str().unwrap().to_owned();
+    sudo(&[
+        "mount",
+        "-t",
+        "btrfs",
+        "-o",
+        "loop,ro",
+        image.path().to_str().unwrap(),
+        &point,
+    ]);
+    // Read everything before asserting anything, so the image is always
+    // unmounted.
+    let read = (|| {
+        let mut seen = Vec::new();
+        for (name, ..) in &expected {
+            let metadata = std::fs::symlink_metadata(mount.path().join(name))?;
+            seen.push((
+                name.clone(),
+                metadata.mode(),
+                metadata.uid(),
+                metadata.gid(),
+                metadata.rdev(),
+            ));
+        }
+        let mut removed = Vec::new();
+        for name in NAMES {
+            removed.push(!mount.path().join(format!("gone-{name}")).exists());
+            let fifo = std::fs::symlink_metadata(mount.path().join(format!("fifo-{name}")))?;
+            removed.push(fifo.file_type().is_fifo());
+        }
+        std::io::Result::Ok((seen, removed))
+    })();
+    sudo(&["umount", &point]);
+    let (seen, checks) = read.unwrap();
+    assert_eq!(seen, expected);
+    assert!(checks.into_iter().all(|held| held));
 }
