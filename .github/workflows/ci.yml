@@ -1177,12 +1177,12 @@ jobs:
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch aarch64 --release --memory 2G \
-            --accel tcg --kernel-feature linux \
+            --accel tcg --smp 4 --kernel-feature linux \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1200,6 +1200,7 @@ jobs:
           # results check-memory.sh records from Linux, which build-fixtures.sh
           # first confirmed on this runner.
           grep -Fqx 'memory:0' linux-smoke.out
+          grep -Fqx 'pthreads:0' linux-smoke.out
           # The system-information suite (#1035) runs as a process with no
           # wall-clock right and no scheduling or resource privilege, the
           # same modes build-fixtures.sh asserts on this Linux runner.
@@ -1860,12 +1861,12 @@ jobs:
           # The single-quoted -c argument is the guest dash's command line; `$?` must reach dash unexpanded.
           # shellcheck disable=SC2016
           ./target/release/helios-inspector vm --arch x86-64 --release --memory 2G \
-            --accel kvm --kernel-feature linux \
+            --accel kvm --smp 4 --kernel-feature linux \
             --runtime-dir "$runtime" --keep-runtime-dir \
             --bootfs-root "$runtime/bootfs" \
             --boot-program dash --boot-program debugger --boot-program cat \
             --no-compiler-plugin \
-            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged' \
+            shell -c '/linux/args 3 中文 日本語 한국어 | cat; /linux/args 3 x >/dev/null; echo "status:$?"; /linux/hello; echo "hello:$?"; /linux/hello-libc; echo "libc:$?"; /linux/fault; echo "fault:$?"; /bin/dash /linux/check-memory.sh /linux/memory; echo "memory:$?"; /bin/dash /linux/check-pthreads.sh /linux/pthreads smp; echo "pthreads:$?"; /linux/clock denied; /linux/random; /linux/identity; /linux/limits unprivileged; /linux/machine; /linux/priority unprivileged' \
             2>&1 > linux-smoke.out | tee "$runtime/inspector.log"
           cat linux-smoke.out
           grep -Fqx 'arg1=3' linux-smoke.out
@@ -1883,6 +1884,7 @@ jobs:
           # results check-memory.sh records from Linux, which build-fixtures.sh
           # first confirmed on this runner.
           grep -Fqx 'memory:0' linux-smoke.out
+          grep -Fqx 'pthreads:0' linux-smoke.out
           # The system-information suite (#1035) runs as a process with no
           # wall-clock right and no scheduling or resource privilege, the
           # same modes build-fixtures.sh asserts on this Linux runner.

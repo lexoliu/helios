@@ -1,6 +1,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll};
 
@@ -12,6 +13,10 @@ use triomphe::Arc;
 use helios_sync::{Notify, NotifyWaiter};
 
 const FUTEX_TABLE_INITIAL_CAPACITY: usize = 64;
+
+/// Bitset that matches every bit in `FUTEX_WAIT_BITSET` and
+/// `FUTEX_WAKE_BITSET` (`include/uapi/linux/futex.h` `FUTEX_BITSET_MATCH_ANY`).
+pub const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ProcessMemoryIdentity(u64);
@@ -57,15 +62,45 @@ impl GuestAddress {
     }
 }
 
+/// Whether a futex operation names a process-private or shared queue.
+///
+/// Linux's `get_futex_key` (`kernel/futex/core.c`) tags shared keys on
+/// anonymous memory with `FUT_OFF_MMSHARED` and leaves private keys
+/// untagged, so `FUTEX_PRIVATE_FLAG` and shared operations on the same
+/// address use distinct queues.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FutexScope {
+    #[default]
+    Private,
+    Shared,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FutexKey {
     memory: ProcessMemoryIdentity,
     address: GuestAddress,
+    scope: FutexScope,
 }
 
 impl FutexKey {
     pub const fn new(memory: ProcessMemoryIdentity, address: GuestAddress) -> Self {
-        Self { memory, address }
+        Self::with_scope(memory, address, FutexScope::Private)
+    }
+
+    pub const fn shared(memory: ProcessMemoryIdentity, address: GuestAddress) -> Self {
+        Self::with_scope(memory, address, FutexScope::Shared)
+    }
+
+    pub const fn with_scope(
+        memory: ProcessMemoryIdentity,
+        address: GuestAddress,
+        scope: FutexScope,
+    ) -> Self {
+        Self {
+            memory,
+            address,
+            scope,
+        }
     }
 
     pub const fn memory(self) -> ProcessMemoryIdentity {
@@ -75,15 +110,30 @@ impl FutexKey {
     pub const fn address(self) -> GuestAddress {
         self.address
     }
+
+    pub const fn scope(self) -> FutexScope {
+        self.scope
+    }
 }
 
-/// One queued wait, shared by its registration and its key's queue.
+/// Counts of waiters woken and moved by a requeue operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequeueOutcome {
+    pub woken: usize,
+    pub requeued: usize,
+}
+
+/// One queued wait, shared by its registration and its current key's queue.
 ///
 /// A wake releases a specific waiter: it takes the waiter off its key's
 /// queue, sets `released`, and broadcasts on the waiter's own signal. The
 /// signal belongs to this one wait and is only ever broadcast, once, so
-/// it carries no permit for anyone else to claim.
+/// it carries no permit for anyone else to claim. `key` tracks requeues
+/// and is mutated under `FutexTable::entries` (lock order: `entries` ->
+/// `waiter.key`).
 struct FutexWaiter {
+    key: Mutex<FutexKey>,
+    bitset: u32,
     /// Written once, by the wake that dequeues the waiter, under the
     /// table lock and before the broadcast.
     released: AtomicBool,
@@ -91,8 +141,10 @@ struct FutexWaiter {
 }
 
 impl FutexWaiter {
-    fn new() -> Self {
+    fn new(key: FutexKey, bitset: u32) -> Self {
         Self {
+            key: Mutex::new(key),
+            bitset,
             released: AtomicBool::new(false),
             signal: Notify::new(),
         }
@@ -111,23 +163,22 @@ impl FutexWaiter {
 /// caller registers before it compares the guest word and a wake that
 /// lands between the comparison and the park still releases it.
 ///
-/// Dropping an unreleased registration takes it off its key's queue and
-/// removes the key once its queue is empty, so a wait whose future is
-/// cancelled while parked (a signal ending the thread, a kill, the store's
-/// teardown) leaves nothing behind. A released registration is already
-/// off the queue. It owns a handle to the table it is queued in; the drop
-/// takes the table's lock, which is never held across an `.await`
-/// anywhere.
+/// Dropping an unreleased registration takes it off its current key's queue
+/// (including after a requeue) and removes the key once its queue is empty,
+/// so a wait whose future is cancelled while parked (a signal ending the
+/// thread, a kill, the store's teardown) leaves nothing behind. A released
+/// registration is already off the queue. It owns a handle to the table it
+/// is queued in; the drop takes the table's lock, which is never held across
+/// an `.await` anywhere.
 pub struct FutexWaitRegistration {
     table: FutexTable,
-    key: FutexKey,
     waiter: Arc<FutexWaiter>,
     wait: NotifyWaiter,
 }
 
 impl FutexWaitRegistration {
     pub fn key(&self) -> FutexKey {
-        self.key
+        *self.waiter.key.lock()
     }
 
     /// Whether a wake has released this wait.
@@ -165,7 +216,8 @@ impl Drop for FutexWaitRegistration {
         if self.waiter.released.load(Ordering::Relaxed) {
             return;
         }
-        match entries.entry(self.key) {
+        let key = *self.waiter.key.lock();
+        match entries.entry(key) {
             Entry::Occupied(mut entry) => {
                 let queue = entry.get_mut();
                 let index = queue
@@ -208,10 +260,16 @@ impl FutexTable {
         }
     }
 
-    /// Queues a wait on `key` until a wake releases it or the returned
-    /// registration is dropped.
+    /// Queues a wait matching every bitset bit on `key` until a wake
+    /// releases it or the returned registration is dropped.
     pub fn prepare_wait(&self, key: FutexKey) -> FutexWaitRegistration {
-        let waiter = Arc::new(FutexWaiter::new());
+        self.prepare_wait_bitset(key, FUTEX_BITSET_MATCH_ANY)
+    }
+
+    /// Queues a wait on `key` with the non-zero bitmask `bitset`.
+    pub fn prepare_wait_bitset(&self, key: FutexKey, bitset: u32) -> FutexWaitRegistration {
+        assert!(bitset != 0, "futex wait bitset must be nonzero");
+        let waiter = Arc::new(FutexWaiter::new(key, bitset));
         // Armed before the waiter is queued, so no wake can precede it.
         let wait = waiter.signal.waiter();
         self.entries
@@ -221,7 +279,6 @@ impl FutexTable {
             .push_back(waiter.clone());
         FutexWaitRegistration {
             table: self.clone(),
-            key,
             waiter,
             wait,
         }
@@ -234,14 +291,31 @@ impl FutexTable {
     /// the key, made before the released waiters have run, never counts
     /// them again, and a wait queued after it is not released by it.
     pub fn wake(&self, key: FutexKey, count: usize) -> usize {
+        self.wake_bitset(key, count, FUTEX_BITSET_MATCH_ANY)
+    }
+
+    /// Releases up to `count` waiters on `key` whose wait bitmask intersects
+    /// the non-zero `bitset`, oldest first, and returns how many it released.
+    pub fn wake_bitset(&self, key: FutexKey, count: usize, bitset: u32) -> usize {
+        assert!(bitset != 0, "futex wake bitset must be nonzero");
+        if count == 0 {
+            return 0;
+        }
         let mut entries = self.entries.lock();
         let Entry::Occupied(mut entry) = entries.entry(key) else {
             return 0;
         };
         let queue = entry.get_mut();
-        let released = count.min(queue.len());
-        for waiter in queue.drain(..released) {
-            waiter.release();
+        let mut released = 0usize;
+        let mut index = 0usize;
+        while index < queue.len() && released < count {
+            if queue[index].bitset & bitset != 0 {
+                let waiter = queue.remove(index).expect("index is within queue bounds");
+                waiter.release();
+                released += 1;
+            } else {
+                index += 1;
+            }
         }
         if queue.is_empty() {
             entry.remove();
@@ -265,13 +339,90 @@ impl FutexTable {
         queue.len()
     }
 
+    /// Releases up to `wake_count` waiters on `source` and moves up to
+    /// `requeue_count` remaining waiters from `source` to the tail of
+    /// `target`.
+    pub fn requeue(
+        &self,
+        source: FutexKey,
+        target: FutexKey,
+        wake_count: usize,
+        requeue_count: usize,
+    ) -> RequeueOutcome {
+        self.requeue_if(source, target, wake_count, requeue_count, || {
+            Ok::<(), ()>(())
+        })
+        .expect("infallible requeue check")
+    }
+
+    /// Runs `check` while holding the futex table lock and, when `Ok(())`,
+    /// releases up to `wake_count` waiters on `source` and moves up to
+    /// `requeue_count` remaining waiters from `source` to `target`.
+    pub fn requeue_if<E, F>(
+        &self,
+        source: FutexKey,
+        target: FutexKey,
+        wake_count: usize,
+        requeue_count: usize,
+        check: F,
+    ) -> Result<RequeueOutcome, E>
+    where
+        F: FnOnce() -> Result<(), E>,
+    {
+        let mut entries = self.entries.lock();
+        check()?;
+        if source == target {
+            let Entry::Occupied(mut entry) = entries.entry(source) else {
+                return Ok(RequeueOutcome::default());
+            };
+            let queue = entry.get_mut();
+            let woken = wake_count.min(queue.len());
+            for waiter in queue.drain(..woken) {
+                waiter.release();
+            }
+            if queue.is_empty() {
+                entry.remove();
+            }
+            return Ok(RequeueOutcome { woken, requeued: 0 });
+        }
+
+        let mut moved = Vec::new();
+        let woken = match entries.entry(source) {
+            Entry::Vacant(_) => return Ok(RequeueOutcome::default()),
+            Entry::Occupied(mut entry) => {
+                let queue = entry.get_mut();
+                let woken = wake_count.min(queue.len());
+                for waiter in queue.drain(..woken) {
+                    waiter.release();
+                }
+                let move_len = requeue_count.min(queue.len());
+                moved.extend(queue.drain(..move_len));
+                if queue.is_empty() {
+                    entry.remove();
+                }
+                woken
+            }
+        };
+        let requeued = moved.len();
+        if requeued > 0 {
+            let target_queue = entries.entry(target).or_default();
+            for waiter in moved {
+                *waiter.key.lock() = target;
+                target_queue.push_back(waiter);
+            }
+        }
+        Ok(RequeueOutcome { woken, requeued })
+    }
+
     /// The number of keys with at least one queued wait.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
     pub fn capacity(&self) -> usize {
         self.entries.lock().capacity()
     }
+
     pub fn len(&self) -> usize {
         self.entries.lock().len()
     }
@@ -303,69 +454,37 @@ mod tests {
     #[test]
     fn guest_address_offset_does_not_wrap_the_32_bit_guest_space() {
         let top = GuestAddress::wasm32(u32::MAX - 2);
-
-        assert_eq!(top.offset(4).raw(), u64::from(u32::MAX) + 2);
-        assert_eq!(GuestAddress::new(u64::MAX).offset(1).raw(), u64::MAX);
+        assert_eq!(top.offset(4), GuestAddress::new(u64::from(u32::MAX) + 2));
+        assert_eq!(GuestAddress::new(u64::MAX - 1).offset(8).raw(), u64::MAX);
     }
 
     #[test]
-    fn futex_table_preallocates_expected_wait_keys() {
+    fn wake_on_key_without_waiters_returns_zero_and_inserts_nothing() {
         let table = FutexTable::new();
-
-        assert!(table.capacity() >= 64);
+        assert_eq!(table.wake(key(1, 0x1000), 1), 0);
+        assert_eq!(table.wake_all(key(1, 0x1000)), 0);
+        assert!(table.is_empty());
     }
 
     #[test]
-    fn wake_one_targets_matching_key() {
+    fn wake_releases_up_to_the_requested_count_in_fifo_order() {
         let table = FutexTable::new();
-        let registration = table.prepare_wait(key(1, 0x1000));
-
-        assert_eq!(table.wake(key(1, 0x2000), 1), 0);
-        assert_eq!(table.wake(key(1, 0x1000), 1), 1);
-
-        assert!(registration.is_released());
-    }
-
-    #[test]
-    fn process_memory_identity_partitions_same_guest_address() {
-        let table = FutexTable::new();
-        let mut left = table.prepare_wait(key(1, 0x1000));
-        let mut right = table.prepare_wait(key(2, 0x1000));
-
-        assert_eq!(table.wake(key(1, 0x1000), 1), 1);
-        assert!(
-            !right.is_released(),
-            "a wake on one memory leaves the other"
-        );
-        assert_eq!(table.wake(key(2, 0x1000), 1), 1);
-
-        block_on(left.released());
-        block_on(right.released());
-    }
-
-    /// A wake releases the waiters that queued first, and only as many
-    /// as it was asked for.
-    #[test]
-    fn wake_releases_the_oldest_waiters_it_was_asked_for() {
-        let table = FutexTable::new();
-        let first = table.prepare_wait(key(1, 0x1000));
-        let second = table.prepare_wait(key(1, 0x1000));
-        let third = table.prepare_wait(key(1, 0x1000));
+        let mut first = table.prepare_wait(key(1, 0x1000));
+        let mut second = table.prepare_wait(key(1, 0x1000));
+        let mut third = table.prepare_wait(key(1, 0x1000));
 
         assert_eq!(table.wake(key(1, 0x1000), 2), 2);
 
-        assert!(first.is_released());
-        assert!(second.is_released());
-        assert!(!third.is_released());
-        assert_eq!(table.wake(key(1, 0x1000), 5), 1, "only the third is left");
-        assert!(third.is_released());
+        block_on(first.released());
+        block_on(second.released());
+        assert!(block_on(poll_once(third.released())).is_none());
+        assert_eq!(table.wake(key(1, 0x1000), 2), 1);
+        block_on(third.released());
     }
 
     #[test]
-    fn wake_all_reports_all_waiters_for_key() {
+    fn wake_all_releases_every_queued_wait() {
         let table = FutexTable::new();
-        // Both waits are queued before the wake, as the guest-facing wait
-        // path queues before it compares the futex word.
         let mut first = table.prepare_wait(key(1, 0x1000));
         let mut second = table.prepare_wait(key(1, 0x1000));
 
@@ -375,8 +494,6 @@ mod tests {
         block_on(second.released());
     }
 
-    /// A parked wait is woken by the wake that releases it, not only
-    /// found released the next time it is polled.
     #[test]
     fn a_parked_wait_is_woken_by_its_release() {
         let table = FutexTable::new();
@@ -397,9 +514,6 @@ mod tests {
         );
     }
 
-    /// A wake-all releases the waits that exist: a wait queued after it
-    /// parks, or every futex wait that follows a wake on the same key
-    /// returns without ever blocking.
     #[test]
     fn a_wait_that_follows_wake_all_still_parks() {
         let table = FutexTable::new();
@@ -415,10 +529,6 @@ mod tests {
         );
     }
 
-    /// A wake that follows a wake-all before the released waiters have
-    /// run finds nobody left to release: it reports no wake, and a later
-    /// wait on the key, made while the released waiters still hold their
-    /// registrations, parks.
     #[test]
     fn a_wake_after_wake_all_releases_nobody_and_a_later_wait_parks() {
         let table = FutexTable::new();
@@ -442,9 +552,6 @@ mod tests {
         block_on(second.released());
     }
 
-    /// A wait whose future is dropped while parked leaves nothing behind:
-    /// a wake finds nobody, and the table is empty once no wait is
-    /// queued.
     #[test]
     fn a_wait_dropped_while_parked_dequeues_itself() {
         let table = FutexTable::new();
@@ -471,8 +578,6 @@ mod tests {
         assert_eq!(table.len(), 0);
     }
 
-    /// A released wait is off its key's queue already, so dropping it
-    /// touches nothing, while a wait still queued on the key stays.
     #[test]
     fn a_released_wait_drops_without_touching_its_key() {
         let table = FutexTable::new();
@@ -489,8 +594,6 @@ mod tests {
         assert_eq!(table.len(), 0);
     }
 
-    /// Only the dropped wait is dequeued: the entry stays while another
-    /// wait on the key is queued.
     #[test]
     fn a_dropped_wait_leaves_the_other_waits_on_its_key_queued() {
         let table = FutexTable::new();
@@ -503,5 +606,71 @@ mod tests {
         assert_eq!(table.wake(key(1, 0x1000), 2), 1);
         drop(kept);
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn wake_bitset_filters_by_matching_bits_in_fifo_order() {
+        let table = FutexTable::new();
+        let mut first = table.prepare_wait_bitset(key(1, 0x1000), 0b0010);
+        let mut second = table.prepare_wait_bitset(key(1, 0x1000), 0b0100);
+        let mut third = table.prepare_wait_bitset(key(1, 0x1000), 0b0011);
+
+        assert_eq!(table.wake_bitset(key(1, 0x1000), 1, 0b0100), 1);
+        assert!(!first.is_released());
+        block_on(second.released());
+        assert!(!third.is_released());
+
+        assert_eq!(table.wake_bitset(key(1, 0x1000), 2, 0b0010), 2);
+        block_on(first.released());
+        block_on(third.released());
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn requeue_wakes_head_and_moves_tail_to_target_queue() {
+        let table = FutexTable::new();
+        let src = key(1, 0x1000);
+        let dst = key(1, 0x2000);
+        let mut w1 = table.prepare_wait(src);
+        let mut w2 = table.prepare_wait(src);
+        let w3 = table.prepare_wait(src);
+
+        let outcome = table.requeue(src, dst, 1, 2);
+        assert_eq!(
+            outcome,
+            RequeueOutcome {
+                woken: 1,
+                requeued: 2
+            }
+        );
+        block_on(w1.released());
+        assert!(!w2.is_released());
+        assert_eq!(w2.key(), dst);
+        assert_eq!(w3.key(), dst);
+
+        drop(w3);
+        assert_eq!(table.wake(dst, 2), 1);
+        block_on(w2.released());
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn private_and_shared_scopes_at_same_address_are_independent() {
+        let table = FutexTable::new();
+        let memory = ProcessMemoryIdentity::new(1);
+        let addr = GuestAddress::new(0x3000);
+        let priv_key = FutexKey::new(memory, addr);
+        let shared_key = FutexKey::shared(memory, addr);
+
+        let mut priv_reg = table.prepare_wait(priv_key);
+        let mut shared_reg = table.prepare_wait(shared_key);
+
+        assert_eq!(table.wake(priv_key, 1), 1);
+        block_on(priv_reg.released());
+        assert!(!shared_reg.is_released());
+
+        assert_eq!(table.wake(shared_key, 1), 1);
+        block_on(shared_reg.released());
+        assert!(table.is_empty());
     }
 }

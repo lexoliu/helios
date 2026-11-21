@@ -308,6 +308,7 @@ impl Drop for Aarch64Tables {
 /// A slice's register record, shared with `native.S`.
 #[derive(Default)]
 #[repr(C)]
+#[derive(Clone)]
 struct Switch {
     x: [u64; 31],
     sp: u64,
@@ -425,6 +426,12 @@ unsafe impl UserContext for Aarch64Context {
         }
         self.switch.tpidr = address.raw() as u64;
         Ok(())
+    }
+
+    fn try_clone(&self) -> Result<Self, NativeError> {
+        Ok(Self {
+            switch: self.switch.clone(),
+        })
     }
 
     fn resume(&mut self, space: &NativeSpace<Aarch64Tables>) -> Stop {

@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 use helios_hal::vmm::PageFlags;
 use helios_linux::abi::Abi;
 use helios_linux::syscall::{
-    Call, Clock, Denied, MapError, MemoryFault, MemoryTotals, NoBacking, Process, Region, Stdio,
-    Stream, System, Thread, UserMemory, VirtualMemory, WriteError, dispatch,
+    Call, Clock, Denied, MapError, MemoryFault, MemoryTotals, NoBacking, Process, Region,
+    SpawnError, SpawnedThread, Stdio, Stream, System, Thread, UserMemory, VirtualMemory,
+    WriteError, dispatch,
 };
 
 const PAGE: u64 = 4096;
@@ -90,6 +91,34 @@ impl UserMemory for Pages {
             self.fill(address + offset as u64, 1, *byte);
         }
         Ok(())
+    }
+    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        if address & 3 != 0 {
+            return Err(MemoryFault);
+        }
+        let mut bytes = [0; 4];
+        self.read(address, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        if address & 3 != 0 {
+            return Err(MemoryFault);
+        }
+        self.write(address, &value.to_le_bytes())
+    }
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<Result<u32, u32>, MemoryFault> {
+        let current = self.atomic_load_u32(address)?;
+        if current == expected {
+            self.atomic_store_u32(address, desired)?;
+            Ok(Ok(current))
+        } else {
+            Ok(Err(current))
+        }
     }
 }
 
@@ -190,6 +219,9 @@ impl Thread for NoThread {
     }
     fn set_thread_pointer(&mut self, _: u64) -> Result<(), Denied> {
         Err(Denied)
+    }
+    fn spawn_thread(&mut self, _: Process<NoBacking>, _: SpawnedThread) -> Result<(), SpawnError> {
+        unreachable!("the memory tests spawn no threads")
     }
 }
 

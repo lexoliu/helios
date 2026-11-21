@@ -8,9 +8,9 @@ use helios_linux::abi::Abi;
 use helios_linux::abi::Operation;
 use helios_linux::elf::{Error, Image};
 use helios_linux::syscall::{
-    Call, Credentials, Denied, Ids, MapError, MemoryFault, MemoryTotals, NoBacking, Process,
-    Region, Start, Stdio, Stream, System, Thread, UserMemory, WriteError,
-    dispatch as linux_dispatch,
+    Call, Credentials, Denied, Exit, Ids, MapError, MemoryFault, MemoryTotals, NoBacking, Process,
+    Region, SpawnError, SpawnedThread, Start, Stdio, Stream, System, Thread, UserMemory,
+    WriteError, dispatch as linux_dispatch,
 };
 
 // The crate root is not `mod.rs`, so the submodule names its directory.
@@ -47,6 +47,9 @@ impl Thread for TestThread {
         self.0.store(address, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
+    fn spawn_thread(&mut self, _: Process<NoBacking>, _: SpawnedThread) -> Result<(), SpawnError> {
+        Err(SpawnError::Busy)
+    }
 }
 
 async fn process_dispatch(
@@ -54,7 +57,7 @@ async fn process_dispatch(
     call: Call,
     memory: &mut Memory,
     sink: &mut Sink,
-) -> ControlFlow<u8, u64> {
+) -> ControlFlow<Exit, u64> {
     let mut thread = TestThread(sink.thread.clone());
     linux_dispatch(process, call, memory, &mut thread, sink).await
 }
@@ -81,6 +84,34 @@ impl UserMemory for Memory {
         let end = start.checked_add(output.len()).ok_or(MemoryFault)?;
         output.copy_from_slice(self.0.get(start..end).ok_or(MemoryFault)?);
         Ok(())
+    }
+    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        if address & 3 != 0 {
+            return Err(MemoryFault);
+        }
+        let mut bytes = [0; 4];
+        self.read(address, &mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        if address & 3 != 0 {
+            return Err(MemoryFault);
+        }
+        self.write(address, &value.to_le_bytes())
+    }
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<Result<u32, u32>, MemoryFault> {
+        let current = self.atomic_load_u32(address)?;
+        if current == expected {
+            self.atomic_store_u32(address, desired)?;
+            Ok(Ok(current))
+        } else {
+            Ok(Err(current))
+        }
     }
 }
 /// The flat memory maps by growing; the calls that change mappings have
@@ -121,7 +152,7 @@ impl helios_linux::syscall::VirtualMemory for Memory {
         unreachable!("the flat test memory maps by growing only")
     }
 }
-async fn dispatch(call: Call, memory: &Memory, sink: &mut Sink) -> ControlFlow<u8, u64> {
+async fn dispatch(call: Call, memory: &Memory, sink: &mut Sink) -> ControlFlow<Exit, u64> {
     process_dispatch(&mut new_process(1), call, &mut memory.clone(), sink).await
 }
 #[derive(Default)]
@@ -289,7 +320,7 @@ fn zero_length_and_fd_register_width_follow_linux() {
 }
 #[test]
 fn exit_never_resumes_and_truncates_status_to_eight_bits() {
-    for number in [60, 231] {
+    for (number, expected) in [(60, Exit::Thread(0x23)), (231, Exit::Group(0x23))] {
         assert_eq!(
             ready(dispatch(
                 Call {
@@ -299,7 +330,7 @@ fn exit_never_resumes_and_truncates_status_to_eight_bits() {
                 &Memory(vec![]),
                 &mut Sink::default()
             )),
-            ControlFlow::Break(0x23)
+            ControlFlow::Break(expected)
         );
     }
 }
@@ -508,7 +539,7 @@ fn aarch64_numbers_reach_the_same_operations_and_legacy_numbers_do_not() {
             &mut memory,
             &mut sink
         )),
-        ControlFlow::Break(9)
+        ControlFlow::Break(Exit::Thread(9))
     );
 }
 
@@ -646,7 +677,7 @@ fn thread_state_round_trips_and_exit_clears_registered_tid() {
             &mut memory,
             &mut sink
         )),
-        ControlFlow::Break(0)
+        ControlFlow::Break(Exit::Thread(0))
     );
     assert_eq!(&memory.0[4..8], &[0; 4]);
 }

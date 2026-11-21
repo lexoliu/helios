@@ -339,6 +339,7 @@ where
                 authority,
                 descriptors,
                 signal_state,
+                spawner,
                 launched_instance,
                 output_mode,
                 executable,

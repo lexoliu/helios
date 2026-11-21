@@ -28,7 +28,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
 use crossbeam_utils::CachePadded;
 use helios_hal::native::{Mapping, NativeError, UserSpace};
@@ -364,6 +364,91 @@ unsafe impl<Tables: UserTranslation> UserSpace for NativeSpace<Tables> {
         let (first, last) = state.pages.span(address, bytes.len() as u64)?;
         state.commit_range(first, last)?;
         state.pages.write(address, bytes, PageFlags::WRITE)
+    }
+
+    fn atomic_load_u32(&self, address: VirtAddr) -> Result<u32, NativeError> {
+        let address = address.raw() as u64;
+        if address & 3 != 0 {
+            return Err(NativeError::Address);
+        }
+        let state = self.shared.state.lock();
+        let (first, _) = state.pages.span(address, 4)?;
+        let page = state.pages.get(first).ok_or(NativeError::NotMapped)?;
+        if !page.flags.contains(PageFlags::READ) {
+            return Err(NativeError::NotMapped);
+        }
+        let Some(frame) = page.frame else {
+            return Ok(0);
+        };
+        let offset = (address - first) as usize;
+        // SAFETY: `address` is 4-byte aligned inside `first`'s 4 KiB frame,
+        // which stays allocated while `state` is locked.
+        let word = unsafe { &*frame.as_ptr().add(offset).cast::<AtomicU32>() };
+        Ok(u32::from_le(word.load(Ordering::SeqCst)))
+    }
+
+    fn atomic_store_u32(&self, address: VirtAddr, value: u32) -> Result<(), NativeError> {
+        let address = address.raw() as u64;
+        if address & 3 != 0 {
+            return Err(NativeError::Address);
+        }
+        let mut state = self.shared.state.lock();
+        let (first, _) = state.pages.span(address, 4)?;
+        let page = state.pages.get(first).ok_or(NativeError::NotMapped)?;
+        if !page.flags.contains(PageFlags::WRITE) {
+            return Err(NativeError::NotMapped);
+        }
+        if page.frame.is_none() {
+            state.commit(first, page.flags)?;
+        }
+        let frame = state
+            .pages
+            .get(first)
+            .and_then(|page| page.frame)
+            .expect("atomic store commits a discarded page first");
+        let offset = (address - first) as usize;
+        // SAFETY: as in `atomic_load_u32`.
+        let word = unsafe { &*frame.as_ptr().add(offset).cast::<AtomicU32>() };
+        word.store(value.to_le(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn atomic_compare_exchange_u32(
+        &self,
+        address: VirtAddr,
+        expected: u32,
+        desired: u32,
+    ) -> Result<Result<u32, u32>, NativeError> {
+        let address = address.raw() as u64;
+        if address & 3 != 0 {
+            return Err(NativeError::Address);
+        }
+        let mut state = self.shared.state.lock();
+        let (first, _) = state.pages.span(address, 4)?;
+        let page = state.pages.get(first).ok_or(NativeError::NotMapped)?;
+        if !page.flags.contains(PageFlags::READ | PageFlags::WRITE) {
+            return Err(NativeError::NotMapped);
+        }
+        if page.frame.is_none() {
+            state.commit(first, page.flags)?;
+        }
+        let frame = state
+            .pages
+            .get(first)
+            .and_then(|page| page.frame)
+            .expect("atomic compare-exchange commits a discarded page first");
+        let offset = (address - first) as usize;
+        // SAFETY: as in `atomic_load_u32`.
+        let word = unsafe { &*frame.as_ptr().add(offset).cast::<AtomicU32>() };
+        Ok(word
+            .compare_exchange(
+                expected.to_le(),
+                desired.to_le(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(u32::from_le)
+            .map_err(u32::from_le))
     }
 
     fn unmap(&self, range: VirtRange) -> Result<(), NativeError> {
@@ -923,5 +1008,128 @@ mod tests {
         assert_eq!(taken, vec![0x11000, 0x12000]);
         assert!(pages.get(0x10000).is_some() && pages.get(0x14000).is_some());
         assert!(!pages.overlaps(0x11000, 0x14000));
+    }
+
+    struct ShootdownLog {
+        events: Mutex<Vec<(u64, u64, usize)>>,
+    }
+
+    // SAFETY: test model records invalidations and checks that removed frames
+    // are still allocated when `invalidate` runs.
+    unsafe impl UserTranslation for alloc::sync::Arc<ShootdownLog> {
+        fn install(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), NativeError> {
+            Ok(())
+        }
+
+        fn uninstall(&mut self, _: u64) {}
+
+        fn protect(&mut self, _: u64, _: PageFlags) {}
+
+        fn invalidate(&self, first: u64, last: u64) {
+            self.events.lock().push((
+                first,
+                last,
+                crate::memory::user_heap_stats().allocated_bytes,
+            ));
+        }
+
+        fn physical(&self, frame: NonNull<u8>) -> u64 {
+            frame.as_ptr() as u64
+        }
+    }
+
+    fn ensure_pool() {
+        const POOL_BYTES: usize = 4 * 1024 * 1024;
+        if crate::memory::installed_user_memory_pool().is_some() {
+            return;
+        }
+        let layout =
+            alloc::alloc::Layout::from_size_align(POOL_BYTES, PAGE as usize).expect("pool layout");
+        // SAFETY: nonzero size, leaked for the process lifetime of the test pool.
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
+        assert!(base != 0, "pool backing");
+        crate::memory::install_user_memory_pool(crate::memory::UserMemoryPool::single_node(
+            1,
+            &[(base, base + POOL_BYTES)],
+        ));
+    }
+
+    #[test]
+    fn shootdown_runs_when_slices_are_active_and_before_frames_reclaim() {
+        ensure_pool();
+        let log = alloc::sync::Arc::new(ShootdownLog {
+            events: Mutex::new(Vec::new()),
+        });
+        let space = NativeSpace::new(log.clone(), PAGE, 1 << 47);
+        let rw = PageFlags::READ | PageFlags::WRITE;
+        let range = |start: usize, pages: usize| {
+            VirtRange::new(VirtAddr::new(start), pages * PAGE as usize)
+        };
+
+        // Without a running slice, removals skip remote invalidation.
+        space.map(range(0x10000, 1), b"solo", rw).unwrap();
+        space.unmap(range(0x10000, 1)).unwrap();
+        assert!(log.events.lock().is_empty());
+
+        // With a sibling slice running, map and widening protect need no
+        // shootdown, while narrowing protect, discard, remap and unmap shoot
+        // down before freeing removed frames.
+        let slice = space.begin_slice();
+        space
+            .map(range(0x20000, 2), b"shared", PageFlags::READ)
+            .unwrap();
+        space.protect(range(0x20000, 2), rw).unwrap();
+        assert!(log.events.lock().is_empty());
+
+        space.protect(range(0x20000, 1), PageFlags::READ).unwrap();
+        assert_eq!(log.events.lock().len(), 1);
+        assert_eq!(log.events.lock()[0].0, 0x20000);
+        assert_eq!(log.events.lock()[0].1, 0x21000);
+
+        let before_discard = crate::memory::user_heap_stats().allocated_bytes;
+        space.discard(range(0x21000, 1)).unwrap();
+        let after_discard = crate::memory::user_heap_stats().allocated_bytes;
+        let (_, _, during_discard) = *log.events.lock().last().unwrap();
+        assert_eq!(during_discard, before_discard);
+        assert!(after_discard < before_discard);
+
+        // Atomic 32-bit operations read zeros from discarded pages, commit on
+        // write/CAS, and enforce alignment and access flags.
+        assert_eq!(space.atomic_load_u32(VirtAddr::new(0x21000)), Ok(0));
+        assert_eq!(
+            space.atomic_load_u32(VirtAddr::new(0x21002)),
+            Err(NativeError::Address)
+        );
+        assert_eq!(
+            space.atomic_store_u32(VirtAddr::new(0x20000), 9),
+            Err(NativeError::NotMapped)
+        );
+        assert_eq!(
+            space.atomic_compare_exchange_u32(VirtAddr::new(0x21004), 0, 0x1234_5678),
+            Ok(Ok(0))
+        );
+        assert_eq!(
+            space.atomic_load_u32(VirtAddr::new(0x21004)),
+            Ok(0x1234_5678)
+        );
+        assert_eq!(
+            space.atomic_compare_exchange_u32(VirtAddr::new(0x21004), 0, 7),
+            Ok(Err(0x1234_5678))
+        );
+
+        space.protect(range(0x20000, 2), rw).unwrap();
+        space.remap(range(0x20000, 2), range(0x30000, 2)).unwrap();
+        assert_eq!(log.events.lock().last().unwrap().0, 0x20000);
+        assert_eq!(log.events.lock().last().unwrap().1, 0x22000);
+
+        let before_unmap = crate::memory::user_heap_stats().allocated_bytes;
+        space.unmap(range(0x30000, 2)).unwrap();
+        let after_unmap = crate::memory::user_heap_stats().allocated_bytes;
+        let (first, last, during_unmap) = *log.events.lock().last().unwrap();
+        assert_eq!((first, last), (0x30000, 0x32000));
+        assert_eq!(during_unmap, before_unmap);
+        assert!(after_unmap < before_unmap);
+
+        drop(slice);
     }
 }

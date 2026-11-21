@@ -205,17 +205,13 @@ pub(super) async fn write_resource<R: Resources, M: UserMemory>(
         _ => errno(EBADF),
     }
 }
-pub(super) async fn read<R: Resources, M: UserMemory, O: Stdio>(
-    table: &mut Descriptors<R>,
+pub(super) async fn read_resource<R: Resources, M: UserMemory>(
+    entry: &Entry<R>,
     args: [u64; 6],
     memory: &mut M,
-    stdio: &mut O,
 ) -> u64 {
-    let Some(entry) = table.get_entry_mut(args[0] as u32 as i32) else {
-        return errno(EBADF);
-    };
     let nonblock = entry.fdflags() & NONBLOCK != 0;
-    match &mut entry.descriptor {
+    match &entry.descriptor {
         FileDescriptor::Event(event) => {
             if args[2] < 8 {
                 return errno(EINVAL);
@@ -254,28 +250,6 @@ pub(super) async fn read<R: Resources, M: UserMemory, O: Stdio>(
             let Some(bytes) = next else {
                 return 0;
             };
-            if memory.write(args[1], &bytes).is_err() {
-                return errno(EFAULT);
-            }
-            bytes.len() as u64
-        }
-        FileDescriptor::Stdin { carry } => {
-            let limit = args[2].min(MAX_RW_COUNT) as usize;
-            if limit == 0 {
-                return 0;
-            }
-            if memory.check_writable(args[1], limit).is_err() {
-                return errno(EFAULT);
-            }
-            // Bytes a reader of the same description took past what it
-            // asked for are this read's first.
-            if carry.is_empty() {
-                match stdio.read_input(limit).await {
-                    Ok(bytes) => *carry = bytes,
-                    Err(Denied) => return errno(EACCES),
-                }
-            }
-            let bytes = carry.split_to(carry.len().min(limit));
             if memory.write(args[1], &bytes).is_err() {
                 return errno(EFAULT);
             }
@@ -500,17 +474,21 @@ impl Wait {
 }
 pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
     abi: Abi,
-    table: &Descriptors<R>,
+    table: &spin::Mutex<Descriptors<R>>,
     args: [u64; 6],
     memory: &mut M,
     clock: &C,
     has_mask: bool,
 ) -> u64 {
-    let Some(entry) = table.get_entry(args[0] as u32 as i32) else {
-        return errno(EBADF);
-    };
-    let FileDescriptor::Epoll(epoll) = &entry.descriptor else {
-        return errno(EINVAL);
+    let epoll = {
+        let table = table.lock();
+        let Some(entry) = table.get_entry(args[0] as u32 as i32) else {
+            return errno(EBADF);
+        };
+        let FileDescriptor::Epoll(epoll) = &entry.descriptor else {
+            return errno(EINVAL);
+        };
+        epoll.clone()
     };
     let data = abi.epoll_data_offset();
     let size = data + 8;
@@ -525,36 +503,40 @@ pub(super) async fn epoll_wait<R: Resources, M: UserMemory, C: Clock>(
     let deadline =
         (timeout >= 0).then(|| clock.now_nanos().saturating_add(timeout as u64 * 1_000_000));
     loop {
-        let interests = epoll.interests();
         let mut waits = Vec::new();
-        arm_waits::<R>(epoll, table, &mut waits);
-        let mut count = 0;
-        for interest in interests {
-            let Some(target) = table.get_entry(interest.fd) else {
-                continue;
-            };
-            let events = ready_mask::<R>(target, table) & (interest.events | EPOLLERR | EPOLLHUP);
-            if events == 0 {
-                continue;
+        {
+            let table = table.lock();
+            let interests = epoll.interests();
+            arm_waits::<R>(&epoll, &table, &mut waits);
+            let mut count = 0;
+            for interest in interests {
+                let Some(target) = table.get_entry(interest.fd) else {
+                    continue;
+                };
+                let events =
+                    ready_mask::<R>(target, &table) & (interest.events | EPOLLERR | EPOLLHUP);
+                if events == 0 {
+                    continue;
+                }
+                let mut event = [0; 16];
+                let bytes = &mut event[..size];
+                bytes[..4].copy_from_slice(&events.to_le_bytes());
+                bytes[data..].copy_from_slice(&interest.data.to_linux().to_le_bytes());
+                if memory
+                    .write(args[1].wrapping_add(count * size as u64), bytes)
+                    .is_err()
+                {
+                    return if count == 0 { errno(EFAULT) } else { count };
+                }
+                epoll.delivered(interest.fd);
+                count += 1;
+                if count == maxevents as u64 {
+                    break;
+                }
             }
-            let mut event = [0; 16];
-            let bytes = &mut event[..size];
-            bytes[..4].copy_from_slice(&events.to_le_bytes());
-            bytes[data..].copy_from_slice(&interest.data.to_linux().to_le_bytes());
-            if memory
-                .write(args[1].wrapping_add(count * size as u64), bytes)
-                .is_err()
-            {
-                return if count == 0 { errno(EFAULT) } else { count };
+            if count != 0 {
+                return count;
             }
-            epoll.delivered(interest.fd);
-            count += 1;
-            if count == maxevents as u64 {
-                break;
-            }
-        }
-        if count != 0 {
-            return count;
         }
         if deadline.is_some_and(|end| clock.now_nanos() >= end) {
             return 0;
@@ -609,6 +591,28 @@ mod tests {
             self.0[address as usize..address as usize + bytes.len()].copy_from_slice(bytes);
             Ok(())
         }
+        fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+            let mut bytes = [0; 4];
+            self.read(address, &mut bytes)?;
+            Ok(u32::from_le_bytes(bytes))
+        }
+        fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+            self.write(address, &value.to_le_bytes())
+        }
+        fn atomic_compare_exchange_u32(
+            &mut self,
+            address: u64,
+            expected: u32,
+            desired: u32,
+        ) -> Result<Result<u32, u32>, MemoryFault> {
+            let current = self.atomic_load_u32(address)?;
+            if current == expected {
+                self.atomic_store_u32(address, desired)?;
+                Ok(Ok(current))
+            } else {
+                Ok(Err(current))
+            }
+        }
     }
     struct Clock;
     impl super::Clock for Clock {
@@ -646,17 +650,19 @@ mod tests {
                 one_shot: false,
             })
             .unwrap();
-        let table: Descriptors<NoBacking> = DescriptorSlots::from_entries(alloc::vec![
-            Some(Entry::<NoBacking>::new(
-                FileDescriptor::Event(event.clone()),
-                false
-            )),
-            Some(Entry::<NoBacking>::new(FileDescriptor::Epoll(child), false)),
-            Some(Entry::<NoBacking>::new(
-                FileDescriptor::Epoll(parent),
-                false
-            )),
-        ]);
+        let table = spin::Mutex::new(DescriptorSlots::<Entry<NoBacking>>::from_entries(
+            alloc::vec![
+                Some(Entry::<NoBacking>::new(
+                    FileDescriptor::Event(event.clone()),
+                    false
+                )),
+                Some(Entry::<NoBacking>::new(FileDescriptor::Epoll(child), false)),
+                Some(Entry::<NoBacking>::new(
+                    FileDescriptor::Epoll(parent),
+                    false
+                )),
+            ],
+        ));
         let mut memory = Memory([0; 64]);
         let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
         let waker = Waker::from(wakes.clone());

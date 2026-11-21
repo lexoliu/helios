@@ -2879,6 +2879,7 @@ dependencies = [
  "helios-sync",
  "helios-unix",
  "object 0.39.1",
+ "spin 0.9.9",
  "thiserror 2.0.21",
 ]
 

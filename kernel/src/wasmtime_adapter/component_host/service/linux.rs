@@ -2,38 +2,48 @@
 //! program service, as a wasm program is, run natively through the
 //! platform's [`helios_hal::native`] capability.
 //!
-//! A Linux process is one executor task, its one thread. The task resumes
-//! the thread's user context for one slice at a time and answers each
-//! system call through `helios-linux`'s decoder, whose descriptors are the
-//! same `helios-unix` objects a WASIX program's are: the table a WASIX
-//! parent hands down (a pipe dash made, its standard streams) is the
-//! table the Linux process reads and writes. Its exit status, or the
-//! signal that ended it, reaches the parent through the child's exit
-//! channel exactly as a wasm child's does.
+//! Each thread of a Linux process runs on its own executor task with its own
+//! [`UserContext`] and [`Process`] handle, sharing one [`UserSpace`] and one
+//! underlying process state (descriptor table, futex queues, program break
+//! and process attributes). Tasks spawned by `clone` / `clone3` enter the
+//! instance's global home-node queue (`InstanceSpawner::try_spawn_detached`),
+//! so online processors steal and execute threads of one process concurrently
+//! across SMP. Its exit status, or the signal that ended it, reaches the
+//! parent through the child's exit channel once every thread of the group has
+//! exited and dropped its handles.
 //!
 //! # Concurrency
 //!
-//! The process's space, context and descriptor table are owned by its
-//! task, which drives one slice or one system call at a time. A signal is
-//! raised on the shared [`WasixSignalState`] and a kill on the instance's
-//! condemnation flag from any processor; the task reads both at every
-//! stop, a slice ends within one timer period by the native contract, and
-//! a system call that suspends is dropped when either arrives.
+//! - User slices and address-space mutations synchronize inside [`UserSpace`],
+//!   which shoots down stale translations across active processors before
+//!   reclaiming physical frames; multi-step VM compositions serialize on the
+//!   process's shared address-space lock in `helios-linux`.
+//! - Process-wide state in [`LinuxShared`] uses lock-free atomics for summed
+//!   processor ticks, fatal-error latch and live spawned-task count, plus a
+//!   bounded non-awaiting `spin::Mutex` for wall-clock offset updates.
+//! - Each thread task checks instance condemnation, thread-group exit and
+//!   process signals before every user slice and again after arming its
+//!   `NotifyWaiter`s around every suspended system call, so `exit_group`, a
+//!   fatal fault, OOM, a signal or a kill wakes every parked sibling at once
+//!   and stops running slices at the next timer preemption.
 
 use super::*;
 use crate::{SetWallClockCap, TerminalInputCap, TerminalOutputCap};
 use core::num::NonZeroU32;
 use core::ops::ControlFlow;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use helios_hal::native::{
-    FaultKind, NativeError, NativeExecution, NativeUnavailable, Stop, UserContext, UserSpace,
+    FaultKind, NativeError, NativeExecution, NativeUnavailable, Stop, UserContext, UserFault,
+    UserSpace,
 };
 use helios_hal::pmm::PhysFrame;
 use helios_hal::vmm::{PageFlags, VirtAddr, VirtRange};
 use helios_linux::abi::{self, Abi};
 use helios_linux::elf::{self, Image};
 use helios_linux::syscall::{
-    self, Call, Denied, EpollData, MapError, MemoryFault, MemoryTotals, Process, Region, Resource,
-    Resources, Start, Stdio, Stream, System, Thread, UserMemory, VirtualMemory, WriteError,
+    self, Call, Denied, EpollData, Exit, MapError, MemoryFault, MemoryTotals, Process, Region,
+    Resource, Resources, SpawnError, SpawnedThread, Start, Stdio, Stream, System, Thread,
+    UserMemory, VirtualMemory, WriteError,
 };
 
 /// The ELF identification bytes every ELF file starts with (System V gABI,
@@ -79,20 +89,6 @@ fn native_unavailable(reason: NativeUnavailable) -> ProgramExecError {
 
 fn user_end<Native: NativeExecution>(native: &Native) -> u64 {
     native.user_range().end().raw() as u64
-}
-
-/// A thread's thread pointer, which lives in its user context.
-struct ContextThread<'a, Context>(&'a mut Context);
-
-impl<Context: UserContext> Thread for ContextThread<'_, Context> {
-    fn thread_pointer(&self) -> u64 {
-        self.0.thread_pointer().raw() as u64
-    }
-    fn set_thread_pointer(&mut self, address: u64) -> Result<(), Denied> {
-        self.0
-            .set_thread_pointer(VirtAddr::new(address as usize))
-            .map_err(|_| Denied)
-    }
 }
 
 /// What a Linux process's [`ProcessAuthority`] lets its system calls
@@ -183,14 +179,39 @@ impl<Space: UserSpace> UserMemory for LinuxMemory<'_, Space> {
             .read(VirtAddr::new(address as usize), output)
             .map_err(|_| MemoryFault)
     }
+
     fn check_writable(&self, address: u64, length: usize) -> Result<(), MemoryFault> {
         self.space
             .check_writable(VirtAddr::new(address as usize), length)
             .map_err(|_| MemoryFault)
     }
+
     fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryFault> {
         self.space
             .write(VirtAddr::new(address as usize), bytes)
+            .map_err(|_| MemoryFault)
+    }
+
+    fn atomic_load_u32(&self, address: u64) -> Result<u32, MemoryFault> {
+        self.space
+            .atomic_load_u32(VirtAddr::new(address as usize))
+            .map_err(|_| MemoryFault)
+    }
+
+    fn atomic_store_u32(&mut self, address: u64, value: u32) -> Result<(), MemoryFault> {
+        self.space
+            .atomic_store_u32(VirtAddr::new(address as usize), value)
+            .map_err(|_| MemoryFault)
+    }
+
+    fn atomic_compare_exchange_u32(
+        &mut self,
+        address: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Result<Result<u32, u32>, MemoryFault> {
+        self.space
+            .atomic_compare_exchange_u32(VirtAddr::new(address as usize), expected, desired)
             .map_err(|_| MemoryFault)
     }
 }
@@ -275,11 +296,9 @@ impl<Space: UserSpace> VirtualMemory for LinuxMemory<'_, Space> {
     }
 }
 
-/// What a Linux process's system calls reach beyond its own state: the
-/// standard streams, routed as the launching program's output mode routes
-/// a wasm child's, and the kernel's clocks, entropy and machine totals,
-/// read from the services a WASIX program's imports read.
-struct LinuxPlatform<CpuImpl, Net, StorageImpl>
+/// Process-wide host state shared across every thread task of one Linux
+/// process.
+struct LinuxShared<CpuImpl, Net, StorageImpl, Space>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -287,24 +306,135 @@ where
 {
     cpu: CpuImpl,
     timer: crate::Timer<CpuImpl>,
+    spawner: crate::InstanceSpawner<CpuImpl>,
     runtime_state: HostRuntimeState<CpuImpl, Net, StorageImpl>,
     read_serial: crate::SerialReader,
     write_serial: crate::DebugSerialWriter,
-    serial_input: Vec<u8>,
     output_mode: OutputMode,
-    instance: crate::InstanceId,
+    launched_instance: crate::RegisteredInstance,
+    signal_state: WasixSignalState,
     grants: LinuxGrants,
     /// The process's view of wall time, which `clock_settime` moves as
-    /// WASIX's `clock_time_set` moves a program's.
-    clock: crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>,
-    entropy: crate::EntropyPool,
+    /// WASIX's `clock_time_set` moves a program's. Never held across `.await`.
+    clock: spin::Mutex<crate::KernelClock<CpuImpl, HostRuntimeState<CpuImpl, Net, StorageImpl>>>,
     instances: crate::InstanceRegistry,
-    /// Timer ticks the thread's user context has run, summed over its
-    /// slices.
-    cpu_ticks: u64,
+    abi: Abi,
+    registers: abi::SystemCallRegisters,
+    user: VirtRange,
+    stack_top: u64,
+    stack_base: usize,
+    image_end: usize,
+    space: Arc<Space>,
+    /// Summed user-slice ticks across every thread of the process
+    /// (`CLOCK_PROCESS_CPUTIME_ID`).
+    process_cpu_ticks: AtomicU64,
+    /// First host-level failure (user memory exhaustion or instance kill)
+    /// observed on any thread of the process.
+    fatal_error: spin::Mutex<Option<ProgramExecError>>,
+    /// Detached thread tasks still executing or dropping their process/space
+    /// handles.
+    running_tasks: AtomicUsize,
+    tasks_drained: helios_sync::Notify,
 }
 
-impl<CpuImpl, Net, StorageImpl> Stdio for LinuxPlatform<CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl, Space> LinuxShared<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    /// Where the initial stack may grow down into: from its initial pages
+    /// down as far as the process's current `RLIMIT_STACK` allows, stopping
+    /// above the highest ELF segment.
+    fn stack_growth(&self, limit: u64) -> VirtRange {
+        let lowest = (self.stack_top.saturating_sub(limit) as usize).max(self.image_end);
+        VirtRange::new(
+            VirtAddr::new(lowest),
+            self.stack_base.saturating_sub(lowest),
+        )
+    }
+
+    fn record_fatal(&self, error: ProgramExecError) {
+        let mut slot = self.fatal_error.lock();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    }
+
+    fn take_fatal(&self) -> Option<ProgramExecError> {
+        self.fatal_error.lock().take()
+    }
+
+    async fn wait_tasks_drained(&self) {
+        loop {
+            let mut waiter = self.tasks_drained.waiter();
+            if self.running_tasks.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            core::future::poll_fn(|cx| self.tasks_drained.poll_notified(cx, &mut waiter)).await;
+        }
+    }
+}
+
+/// Decrements [`LinuxShared::running_tasks`] after a spawned thread task has
+/// finished [`drive_linux_thread`] and dropped its `Process`, `UserContext`
+/// and `LinuxThreadPlatform`.
+struct TaskDrainGuard<CpuImpl, Net, StorageImpl, Space>(
+    Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>,
+)
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage;
+
+impl<CpuImpl, Net, StorageImpl, Space> Drop for TaskDrainGuard<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn drop(&mut self) {
+        if self.0.running_tasks.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.tasks_drained.notify_all();
+        }
+    }
+}
+
+/// Per-thread host state: thread-local serial buffer, per-thread DRBG stream,
+/// and per-thread slice tick counter (`CLOCK_THREAD_CPUTIME_ID`).
+struct LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    shared: Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>,
+    serial_input: Vec<u8>,
+    entropy: crate::EntropyPool,
+    thread_cpu_ticks: u64,
+}
+
+impl<CpuImpl, Net, StorageImpl, Space> LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn new(shared: Arc<LinuxShared<CpuImpl, Net, StorageImpl, Space>>, tid: NonZeroU32) -> Self {
+        let personalization = shared.launched_instance.id().raw() ^ (u64::from(tid.get()) << 32);
+        let entropy =
+            crate::EntropyPool::derive(shared.runtime_state.root_entropy(), personalization);
+        Self {
+            shared,
+            serial_input: Vec::new(),
+            entropy,
+            thread_cpu_ticks: 0,
+        }
+    }
+}
+
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> Stdio
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -315,19 +445,28 @@ where
             Stream::Stdout => crate::ComponentOutputStreamKind::Stdout,
             Stream::Stderr => crate::ComponentOutputStreamKind::Stderr,
         };
-        let writer = match self.output_mode.sink(kind, self.instance) {
+        let writer = match self
+            .shared
+            .output_mode
+            .sink(kind, self.shared.launched_instance.id())
+        {
             // The terminal is the one destination the stream reaches on
             // the process's own authority; a channel or a log belongs to
             // whoever routed the stream there.
             crate::ComponentOutputSink::Local(crate::LocalOutputSink::Serial)
-                if self.grants.terminal_output.is_none() =>
+                if self.shared.grants.terminal_output.is_none() =>
             {
                 return Err(WriteError::Denied);
             }
             crate::ComponentOutputSink::Local(local) => loop {
                 // Zero means another processor owns the debug UART now:
                 // offer the same bytes again after a yield.
-                let taken = local.write(&self.cpu, &self.runtime_state, self.write_serial, bytes);
+                let taken = local.write(
+                    &self.shared.cpu,
+                    &self.shared.runtime_state,
+                    self.shared.write_serial,
+                    bytes,
+                );
                 if taken != 0 || bytes.is_empty() {
                     return Ok(taken);
                 }
@@ -342,13 +481,13 @@ where
     }
 
     async fn read_input(&mut self, limit: usize) -> Result<Bytes, Denied> {
-        Ok(match self.output_mode.stdin_route() {
-            crate::ComponentInputRoute::Serial if self.grants.terminal_input.is_none() => {
+        Ok(match self.shared.output_mode.stdin_route() {
+            crate::ComponentInputRoute::Serial if self.shared.grants.terminal_input.is_none() => {
                 return Err(Denied);
             }
             crate::ComponentInputRoute::Serial => loop {
-                let wait = self.write_serial.wait_for_debug_serial_input();
-                (self.read_serial)(
+                let wait = self.shared.write_serial.wait_for_debug_serial_input();
+                (self.shared.read_serial)(
                     &mut self.serial_input,
                     u32::try_from(limit).unwrap_or(u32::MAX),
                 );
@@ -365,7 +504,8 @@ where
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> syscall::Clock for LinuxPlatform<CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> syscall::Clock
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
@@ -373,38 +513,59 @@ where
 {
     /// The uptime clock, the one WASIX's `clock_time_get` reads.
     fn now_nanos(&self) -> u64 {
-        self.clock.monotonic_nanos()
+        self.shared
+            .runtime_state
+            .uptime_nanos(self.shared.cpu.now().ticks())
     }
+
     async fn sleep_until(&self, deadline: u64) {
         let remaining = deadline.saturating_sub(self.now_nanos());
-        self.timer.sleep_for(Duration::from_nanos(remaining)).await;
+        self.shared
+            .timer
+            .sleep_for(Duration::from_nanos(remaining))
+            .await;
     }
 }
 
-impl<CpuImpl, Net, StorageImpl> System for LinuxPlatform<CpuImpl, Net, StorageImpl>
+impl<CpuImpl, Net, StorageImpl, Space: UserSpace> System
+    for LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Space>
 where
     CpuImpl: Cpu + Clone,
     Net: ComponentHostNetwork,
     StorageImpl: crate::Storage,
 {
     fn realtime_nanos(&self) -> u64 {
-        self.clock.system_time_nanos()
+        self.shared.clock.lock().system_time_nanos()
     }
 
     fn set_realtime_nanos(&mut self, nanos: u64) -> Result<(), Denied> {
         // The right WASIX's `clock_time_set` derives.
-        let cap = self.grants.set_wall_clock.as_ref().ok_or(Denied)?;
-        self.clock.set_system_time_nanos(cap, nanos);
+        let cap = self.shared.grants.set_wall_clock.as_ref().ok_or(Denied)?;
+        self.shared.clock.lock().set_system_time_nanos(cap, nanos);
         Ok(())
     }
 
     fn cpu_nanos(&self) -> u64 {
-        self.cpu.timebase().ticks_to_nanos(self.cpu_ticks)
+        self.shared
+            .cpu
+            .timebase()
+            .ticks_to_nanos(self.thread_cpu_ticks)
+    }
+
+    fn process_cpu_nanos(&self) -> u64 {
+        self.shared
+            .cpu
+            .timebase()
+            .ticks_to_nanos(self.shared.process_cpu_ticks.load(Ordering::Relaxed))
+    }
+
+    fn processor_count(&self) -> u32 {
+        u32::try_from(self.shared.cpu.processor_count().max(1)).unwrap_or(u32::MAX)
     }
 
     fn fill_random(&mut self, output: &mut [u8]) {
         self.entropy
-            .fill_secure(self.runtime_state.root_entropy(), output);
+            .fill_secure(self.shared.runtime_state.root_entropy(), output);
     }
 
     fn memory(&self) -> MemoryTotals {
@@ -416,7 +577,7 @@ where
     }
 
     fn process_count(&self) -> u32 {
-        u32::try_from(self.instances.count()).unwrap_or(u32::MAX)
+        u32::try_from(self.shared.instances.count()).unwrap_or(u32::MAX)
     }
 
     fn kernel_version(&self) -> &str {
@@ -424,15 +585,324 @@ where
     }
 }
 
-/// What ended a system call the process was suspended in.
+/// Calling thread's context view for `arch_prctl` and `clone` / `clone3`.
+struct ContextThread<'a, CpuImpl, Net, StorageImpl, Context: UserContext>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    context: &'a mut Context,
+    shared: &'a Arc<LinuxShared<CpuImpl, Net, StorageImpl, Context::Space>>,
+}
+
+impl<CpuImpl, Net, StorageImpl, Context: UserContext> Thread<LinuxResources<Net>>
+    for ContextThread<'_, CpuImpl, Net, StorageImpl, Context>
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    fn thread_pointer(&self) -> u64 {
+        self.context.thread_pointer().raw() as u64
+    }
+
+    fn set_thread_pointer(&mut self, address: u64) -> Result<(), Denied> {
+        self.context
+            .set_thread_pointer(VirtAddr::new(address as usize))
+            .map_err(|_| Denied)
+    }
+
+    fn spawn_thread(
+        &mut self,
+        child: Process<LinuxResources<Net>>,
+        state: SpawnedThread,
+    ) -> Result<(), SpawnError> {
+        let mut child_context = self
+            .context
+            .try_clone()
+            .map_err(|_| SpawnError::OutOfMemory)?;
+        if let Some(tls) = state.tls {
+            child_context
+                .set_thread_pointer(VirtAddr::new(tls as usize))
+                .map_err(|_| SpawnError::InvalidTls)?;
+        }
+        if let Some(stack) = state.stack {
+            child_context
+                .set_register(self.shared.abi.stack_pointer_register(), stack)
+                .expect("the ABI names registers of this instruction set");
+        }
+        child_context
+            .set_register(self.shared.registers.result, 0)
+            .expect("the ABI names registers of this instruction set");
+        let child_platform = LinuxThreadPlatform::new(self.shared.clone(), child.tid());
+        self.shared.running_tasks.fetch_add(1, Ordering::SeqCst);
+        let guard = TaskDrainGuard(self.shared.clone());
+        self.shared
+            .spawner
+            .try_spawn_detached(async move {
+                drive_linux_thread(child_context, child, child_platform).await;
+                drop(guard);
+            })
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "helios_kernel::linux",
+                    instance = ?self.shared.launched_instance.id(),
+                    %error,
+                    "refused a Linux thread: the executor's instance share is full"
+                );
+                SpawnError::Busy
+            })
+    }
+}
+
+/// What ended a system call a thread was suspended in.
 enum CallEnd {
-    Done(ControlFlow<u8, u64>),
-    /// A signal or a kill arrived; the loop's next check acts on it.
+    Done(ControlFlow<Exit, u64>),
+    /// Thread-group exit, signal, or instance kill arrived; the loop's next
+    /// check acts on it.
     Stopped,
 }
 
+fn check_thread_stop<CpuImpl, Net, StorageImpl, Space>(
+    process: &mut Process<LinuxResources<Net>>,
+    shared: &LinuxShared<CpuImpl, Net, StorageImpl, Space>,
+) -> bool
+where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+{
+    if let Some(reason) = shared.launched_instance.pending_kill() {
+        match reason {
+            crate::KillReason::Operator | crate::KillReason::RequesterGone => {
+                process.terminate_group(helios_unix::ChildTermination::Killed);
+            }
+            crate::KillReason::OutOfMemory
+            | crate::KillReason::SupervisorRestart
+            | crate::KillReason::StoreFailed => {
+                shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
+                    crate::InstanceKilled { reason },
+                )));
+                process.terminate_group(helios_unix::ChildTermination::Killed);
+            }
+        }
+        return true;
+    }
+    if process.group_ended() {
+        return true;
+    }
+    if let Some(signal) = shared.signal_state.take_pending() {
+        process.terminate_group(helios_unix::ChildTermination::Signaled(
+            helios_unix::SignalTermination {
+                signal: signal.raw(),
+                core_dumped: false,
+            },
+        ));
+        return true;
+    }
+    false
+}
+
+fn terminate_on_fault<Net: ComponentHostNetwork>(
+    process: &mut Process<LinuxResources<Net>>,
+    instance_id: crate::InstanceId,
+    fault: UserFault,
+) {
+    tracing::debug!(
+        target: "helios_kernel::linux",
+        instance = ?instance_id,
+        tid = process.tid().get(),
+        ?fault,
+        "Linux thread faulted"
+    );
+    process.terminate_group(helios_unix::ChildTermination::Signaled(
+        helios_unix::SignalTermination {
+            signal: abi::fault_signal(fault.kind),
+            core_dumped: false,
+        },
+    ));
+}
+
+/// Drives one Linux thread (`main` or a `clone`-spawned worker) until that
+/// thread exits (`exit`), condemns the group (`exit_group`, unhandled fault,
+/// OOM), or observes condemnation from a sibling, signal or kill.
+async fn drive_linux_thread<CpuImpl, Net, StorageImpl, Context>(
+    mut context: Context,
+    mut process: Process<LinuxResources<Net>>,
+    mut platform: LinuxThreadPlatform<CpuImpl, Net, StorageImpl, Context::Space>,
+) where
+    CpuImpl: Cpu + Clone,
+    Net: ComponentHostNetwork,
+    StorageImpl: crate::Storage,
+    Context: UserContext,
+{
+    let shared = platform.shared.clone();
+    let observer = process.observer();
+    let instance_id = shared.launched_instance.id();
+    let registers = shared.registers;
+    loop {
+        if check_thread_stop(&mut process, &shared) {
+            break;
+        }
+        let slice_began = shared.cpu.now().ticks();
+        let stop = context.resume(&shared.space);
+        let elapsed = shared.cpu.now().ticks().saturating_sub(slice_began);
+        platform.thread_cpu_ticks += elapsed;
+        shared
+            .process_cpu_ticks
+            .fetch_add(elapsed, Ordering::Relaxed);
+        match stop {
+            Stop::SystemCall => {
+                let call = {
+                    let read = |register| {
+                        context
+                            .register(register)
+                            .expect("the ABI names registers of this instruction set")
+                    };
+                    Call {
+                        number: read(registers.number),
+                        arguments: registers.arguments.map(read),
+                    }
+                };
+                // Arm every stop source before testing them so an `exit_group`,
+                // signal or kill raised during the user slice cannot be missed
+                // before `dispatch` suspends.
+                let mut group_wait = observer.waiter();
+                let mut signal_wait = shared.signal_state.wait_state();
+                let mut kill_wait = shared.launched_instance.arm_kill_wait();
+                if check_thread_stop(&mut process, &shared) {
+                    break;
+                }
+                let ended = {
+                    let mut memory = LinuxMemory {
+                        space: &*shared.space,
+                        user: shared.user,
+                    };
+                    let mut thread = ContextThread {
+                        context: &mut context,
+                        shared: &shared,
+                    };
+                    let mut call = core::pin::pin!(syscall::dispatch(
+                        &mut process,
+                        call,
+                        &mut memory,
+                        &mut thread,
+                        &mut platform,
+                    ));
+                    core::future::poll_fn(|cx| {
+                        if let Poll::Ready(flow) = call.as_mut().poll(cx) {
+                            return Poll::Ready(CallEnd::Done(flow));
+                        }
+                        let group_stopped = observer.poll_changed(cx, &mut group_wait).is_ready();
+                        let signalled = shared
+                            .signal_state
+                            .poll_changed(cx, &mut signal_wait)
+                            .is_ready();
+                        let killed = shared
+                            .launched_instance
+                            .poll_kill_wait(cx, &mut kill_wait)
+                            .is_ready();
+                        if group_stopped || signalled || killed {
+                            Poll::Ready(CallEnd::Stopped)
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await
+                };
+                match ended {
+                    CallEnd::Done(ControlFlow::Continue(result)) => context
+                        .set_register(registers.result, result)
+                        .expect("the ABI names registers of this instruction set"),
+                    CallEnd::Done(ControlFlow::Break(_)) => break,
+                    CallEnd::Stopped => {}
+                }
+            }
+            Stop::Preempted | Stop::Interrupted => crate::yield_now().await,
+            Stop::Fault(fault) => match fault.kind {
+                // A discarded page's first touch, a translation older than the
+                // page's current access, or growth of the initial stack:
+                // resolved atomically against concurrent sibling VM ops.
+                FaultKind::Page {
+                    address,
+                    access,
+                    present,
+                } if shared.user.contains(address) => {
+                    match shared.space.resolve_fault(address, access) {
+                        Ok(()) => {}
+                        Err(NativeError::OutOfMemory) => {
+                            shared.record_fatal(native_error(NativeError::OutOfMemory));
+                            process.terminate_group(helios_unix::ChildTermination::Killed);
+                            break;
+                        }
+                        Err(NativeError::NotMapped)
+                            if !present
+                                && !access.contains(PageFlags::EXECUTE)
+                                && shared
+                                    .stack_growth(process.limit(Resource::Stack).current)
+                                    .contains(address) =>
+                        {
+                            let page = VirtRange::new(address.page_floor(), PhysFrame::SIZE);
+                            match shared
+                                .space
+                                .map(page, &[], PageFlags::READ | PageFlags::WRITE)
+                            {
+                                Ok(()) => {}
+                                // A sibling thread mapped or grew this stack
+                                // page concurrently; verify the installed page
+                                // satisfies `access`.
+                                Err(NativeError::Overlap) => {
+                                    match shared.space.resolve_fault(address, access) {
+                                        Ok(()) => {}
+                                        Err(NativeError::OutOfMemory) => {
+                                            shared.record_fatal(native_error(
+                                                NativeError::OutOfMemory,
+                                            ));
+                                            process.terminate_group(
+                                                helios_unix::ChildTermination::Killed,
+                                            );
+                                            break;
+                                        }
+                                        Err(NativeError::NotMapped) => {
+                                            terminate_on_fault(&mut process, instance_id, fault);
+                                            break;
+                                        }
+                                        Err(error) => panic!(
+                                            "resolving a concurrent stack fault on {page:?}: {error}"
+                                        ),
+                                    }
+                                }
+                                Err(NativeError::OutOfMemory) => {
+                                    shared.record_fatal(native_error(NativeError::OutOfMemory));
+                                    process.terminate_group(helios_unix::ChildTermination::Killed);
+                                    break;
+                                }
+                                Err(error) => {
+                                    panic!("growing a Linux stack into {page:?}: {error}")
+                                }
+                            }
+                        }
+                        Err(NativeError::NotMapped) => {
+                            terminate_on_fault(&mut process, instance_id, fault);
+                            break;
+                        }
+                        Err(error) => panic!("resolving a page fault at {address:?}: {error}"),
+                    }
+                }
+                _ => {
+                    terminate_on_fault(&mut process, instance_id, fault);
+                    break;
+                }
+            },
+        }
+    }
+}
+
 /// Runs a Linux process to its end: maps `executable`, builds its initial
-/// stack from `argv` and `env`, and drives its one thread.
+/// stack from `argv` and `env`, drives `main` and every thread spawned via
+/// `clone` / `clone3`, and returns once every thread task has exited and
+/// released the process's resources.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
     exec_context: ProgramExecContext<CpuImpl, Net, StorageImpl>,
@@ -441,6 +911,7 @@ pub(super) async fn run_linux_process<CpuImpl, Net, StorageImpl>(
     authority: ProcessAuthority,
     descriptors: Option<Preview1DescriptorTable<Net>>,
     signal_state: WasixSignalState,
+    spawner: crate::InstanceSpawner<CpuImpl>,
     launched_instance: crate::RegisteredInstance,
     output_mode: OutputMode,
     executable: LinuxExecutable,
@@ -458,7 +929,7 @@ where
     let native = cpu.native().map_err(native_unavailable)?;
     let image =
         Image::parse(&executable.image, executable.abi, user_end(native)).map_err(image_error)?;
-    let space = native.create_space().map_err(native_error)?;
+    let space = Arc::new(native.create_space().map_err(native_error)?);
     // The end of the highest segment: the stack never grows down past it,
     // whatever its limit, so a wild pointer into the unmapped space below
     // the stack stays a fault.
@@ -520,17 +991,7 @@ where
             PageFlags::READ | PageFlags::WRITE,
         )
         .map_err(native_error)?;
-    // Where the stack may grow into: from its initial pages down as far as
-    // the process's current `RLIMIT_STACK` allows. An argument vector
-    // larger than the limit leaves it no room.
-    let growth = |limit: u64| {
-        let lowest = (top.saturating_sub(limit) as usize).max(image_end);
-        VirtRange::new(
-            VirtAddr::new(lowest),
-            (stack.base as usize).saturating_sub(lowest),
-        )
-    };
-    let mut context = native
+    let context = native
         .create_context(
             VirtAddr::new(image.entry() as usize),
             VirtAddr::new(stack.pointer as usize),
@@ -547,7 +1008,7 @@ where
     };
     // The launch hands a process no user or group IDs, so it reports zero
     // ones; the machine's memory sizes the limits Linux derives from it.
-    let mut process = Process::<LinuxResources<Net>>::with_descriptors(
+    let process = Process::<LinuxResources<Net>>::with_descriptors(
         executable.abi,
         pid,
         image.program_break(PhysFrame::SIZE as u64),
@@ -557,165 +1018,204 @@ where
             ..Start::default()
         },
     );
-    let mut stdio = LinuxPlatform {
+    let observer = process.observer();
+    let shared = Arc::new(LinuxShared {
         cpu: cpu.clone(),
         timer: exec_context.timer.clone(),
+        spawner,
         runtime_state: exec_context.runtime_state.clone(),
         read_serial: exec_context.read_serial,
         write_serial: exec_context.write_serial,
-        serial_input: Vec::new(),
         output_mode,
-        instance: instance_id,
+        launched_instance,
+        signal_state,
         grants: LinuxGrants::derive(&authority),
-        clock: crate::KernelClock::new(cpu.clone(), exec_context.runtime_state.clone()),
-        entropy: crate::EntropyPool::derive(
-            exec_context.runtime_state.root_entropy(),
-            instance_id.raw(),
-        ),
+        clock: spin::Mutex::new(crate::KernelClock::new(
+            cpu.clone(),
+            exec_context.runtime_state.clone(),
+        )),
         instances: exec_context.instance_registry.clone(),
-        cpu_ticks: 0,
-    };
-    let registers = executable.abi.system_call_registers();
-    let exit = |termination: helios_unix::ChildTermination| ChildExit {
-        instance_id,
-        termination,
-        filesystem: None,
-    };
+        abi: executable.abi,
+        registers: executable.abi.system_call_registers(),
+        user,
+        stack_top: top,
+        stack_base: stack.base as usize,
+        image_end,
+        space,
+        process_cpu_ticks: AtomicU64::new(0),
+        fatal_error: spin::Mutex::new(None),
+        running_tasks: AtomicUsize::new(0),
+        tasks_drained: helios_sync::Notify::new(),
+    });
+    let main_platform = LinuxThreadPlatform::new(shared.clone(), pid);
+
     timeline.record(&cpu, LaunchPhase::GuestBegin);
-    let end = loop {
-        if let Some(reason) = launched_instance.pending_kill() {
-            break match reason {
+    // `drive_linux_thread` consumes `main`'s `Process` and `Context`, so if
+    // `main` calls `SYS_exit` (`pthread_exit`) while worker threads continue,
+    // `main`'s thread handle withdraws immediately without holding the group
+    // open.
+    drive_linux_thread(context, process, main_platform).await;
+
+    // Wait for every live sibling thread to exit, still honouring external
+    // signals and instance kills while `main` is already gone.
+    loop {
+        let mut group_wait = observer.waiter();
+        let mut signal_wait = shared.signal_state.wait_state();
+        let mut kill_wait = shared.launched_instance.arm_kill_wait();
+        if let Some(reason) = shared.launched_instance.pending_kill() {
+            match reason {
                 crate::KillReason::Operator | crate::KillReason::RequesterGone => {
-                    Ok(exit(helios_unix::ChildTermination::Killed))
+                    observer.terminate_group(helios_unix::ChildTermination::Killed);
                 }
-                _ => Err(map_program_runtime_error(wasmtime::Error::from(
-                    crate::InstanceKilled { reason },
-                ))),
-            };
-        }
-        if let Some(signal) = signal_state.take_pending() {
-            break Ok(exit(helios_unix::ChildTermination::Signaled(
+                crate::KillReason::OutOfMemory
+                | crate::KillReason::SupervisorRestart
+                | crate::KillReason::StoreFailed => {
+                    shared.record_fatal(map_program_runtime_error(wasmtime::Error::from(
+                        crate::InstanceKilled { reason },
+                    )));
+                    observer.terminate_group(helios_unix::ChildTermination::Killed);
+                }
+            }
+        } else if !observer.group_ended()
+            && let Some(signal) = shared.signal_state.take_pending()
+        {
+            observer.terminate_group(helios_unix::ChildTermination::Signaled(
                 helios_unix::SignalTermination {
                     signal: signal.raw(),
                     core_dumped: false,
                 },
-            )));
+            ));
         }
-        let slice_began = cpu.now().ticks();
-        let stop = context.resume(&space);
-        stdio.cpu_ticks += cpu.now().ticks().saturating_sub(slice_began);
-        match stop {
-            Stop::SystemCall => {
-                let read = |register| {
-                    context
-                        .register(register)
-                        .expect("the ABI names registers of this instruction set")
-                };
-                let call = Call {
-                    number: read(registers.number),
-                    arguments: registers.arguments.map(read),
-                };
-                // Armed before the check at the top of the next turn
-                // reads them, so a raise or kill during the call is seen.
-                let mut signal_wait = signal_state.wait_state();
-                let mut kill_wait = launched_instance.arm_kill_wait();
-                // The call borrows the context for its thread pointer; the
-                // block ends that borrow before its result is written back.
-                let ended = {
-                    let mut memory = LinuxMemory {
-                        space: &space,
-                        user,
-                    };
-                    let mut thread = ContextThread(&mut context);
-                    let mut call = core::pin::pin!(syscall::dispatch(
-                        &mut process,
-                        call,
-                        &mut memory,
-                        &mut thread,
-                        &mut stdio
-                    ));
-                    core::future::poll_fn(|cx| {
-                        if let Poll::Ready(flow) = call.as_mut().poll(cx) {
-                            return Poll::Ready(CallEnd::Done(flow));
-                        }
-                        let signalled = signal_state.poll_changed(cx, &mut signal_wait).is_ready();
-                        let killed = launched_instance
-                            .poll_kill_wait(cx, &mut kill_wait)
-                            .is_ready();
-                        if signalled || killed {
-                            Poll::Ready(CallEnd::Stopped)
-                        } else {
-                            Poll::Pending
-                        }
-                    })
-                    .await
-                };
-                match ended {
-                    CallEnd::Done(ControlFlow::Continue(result)) => context
-                        .set_register(registers.result, result)
-                        .expect("the ABI names registers of this instruction set"),
-                    CallEnd::Done(ControlFlow::Break(status)) => {
-                        break Ok(exit(helios_unix::ChildTermination::Exited(u32::from(
-                            status,
-                        ))));
-                    }
-                    CallEnd::Stopped => {}
-                }
+        if observer.all_threads_exited() {
+            break;
+        }
+        core::future::poll_fn(|cx| {
+            let group_changed = observer.poll_changed(cx, &mut group_wait).is_ready();
+            let signalled = shared
+                .signal_state
+                .poll_changed(cx, &mut signal_wait)
+                .is_ready();
+            let killed = shared
+                .launched_instance
+                .poll_kill_wait(cx, &mut kill_wait)
+                .is_ready();
+            if group_changed || signalled || killed {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
             }
-            Stop::Preempted | Stop::Interrupted => crate::yield_now().await,
-            Stop::Fault(fault) => match fault.kind {
-                // A discarded page's first touch, or a translation older
-                // than the page's current access: the space answers both,
-                // and the context retries the access.
-                FaultKind::Page {
-                    address, access, ..
-                } if user.contains(address)
-                    && space
-                        .mapping(VirtRange::new(address.page_floor(), PhysFrame::SIZE))
-                        .is_some_and(|page| page.flags.contains(access)) =>
-                {
-                    match space.resolve_fault(address, access) {
-                        Ok(()) => {}
-                        Err(NativeError::OutOfMemory) => {
-                            break Err(native_error(NativeError::OutOfMemory));
-                        }
-                        Err(error) => panic!("resolving a fault on a mapped page: {error}"),
-                    }
-                }
-                FaultKind::Page {
-                    address,
-                    present: false,
-                    ..
-                } if growth(process.limit(Resource::Stack).current).contains(address) => {
-                    let page = VirtRange::new(address.page_floor(), PhysFrame::SIZE);
-                    match space.map(page, &[], PageFlags::READ | PageFlags::WRITE) {
-                        Ok(()) => {}
-                        Err(NativeError::OutOfMemory) => {
-                            break Err(native_error(NativeError::OutOfMemory));
-                        }
-                        Err(error) => panic!("growing a Linux stack into {page:?}: {error}"),
-                    }
-                }
-                kind => {
-                    tracing::debug!(
-                        target: "helios_kernel::linux",
-                        instance = ?instance_id,
-                        ?fault,
-                        "Linux process faulted"
-                    );
-                    break Ok(exit(helios_unix::ChildTermination::Signaled(
-                        helios_unix::SignalTermination {
-                            signal: abi::fault_signal(kind),
-                            core_dumped: false,
-                        },
-                    )));
-                }
-            },
-        }
-    };
+        })
+        .await;
+    }
+
+    // Wait for every detached thread task to drop its `Process` (descriptor
+    // table) and `Arc<Space>` before reporting `ChildExit` to the parent.
+    shared.wait_tasks_drained().await;
     timeline.record(&cpu, LaunchPhase::GuestEnd);
-    // The descriptor table goes before the parent hears of the exit, so a
-    // reader of a pipe this process held sees its end first.
-    drop(process);
-    end
+
+    let fatal = shared.take_fatal();
+    let termination = observer.termination();
+    drop(observer);
+    drop(shared);
+
+    match fatal {
+        Some(error) => Err(error),
+        None => Ok(ChildExit {
+            instance_id,
+            termination,
+            filesystem: None,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{
+        NativeSpace, UserMemoryPool, UserTranslation, install_user_memory_pool,
+        installed_user_memory_pool,
+    };
+    use core::alloc::Layout;
+    use core::ptr::NonNull;
+
+    fn ensure_pool() {
+        const POOL_BYTES: usize = 4 * 1024 * 1024;
+        if installed_user_memory_pool().is_some() {
+            return;
+        }
+        let layout = Layout::from_size_align(POOL_BYTES, PhysFrame::SIZE).expect("pool layout");
+        // SAFETY: nonzero size, leaked for the lifetime of the test process.
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) } as usize;
+        assert!(base != 0, "pool backing");
+        install_user_memory_pool(UserMemoryPool::single_node(1, &[(base, base + POOL_BYTES)]));
+    }
+
+    struct DummyTables;
+
+    // SAFETY: host unit test uses `NativeSpace`'s direct-map operations only
+    // and never enters hardware user mode.
+    unsafe impl UserTranslation for DummyTables {
+        fn install(&mut self, _: u64, _: u64, _: PageFlags) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn uninstall(&mut self, _: u64) {}
+        fn protect(&mut self, _: u64, _: PageFlags) {}
+        fn invalidate(&self, _: u64, _: u64) {}
+        fn physical(&self, frame: NonNull<u8>) -> u64 {
+            frame.as_ptr() as u64
+        }
+    }
+
+    #[test]
+    fn linux_memory_atomic_u32_ops_commit_discarded_pages_and_enforce_permissions() {
+        ensure_pool();
+        let start = PhysFrame::SIZE;
+        let end = 1 << 32;
+        let space = NativeSpace::new(DummyTables, start as u64, end as u64);
+        let user = VirtRange::new(VirtAddr::new(start), end - start);
+        let mut memory = LinuxMemory {
+            space: &space,
+            user,
+        };
+
+        let rw_addr = 0x10_000u64;
+        memory
+            .map_at(
+                rw_addr,
+                PhysFrame::SIZE as u64,
+                PageFlags::READ | PageFlags::WRITE,
+            )
+            .unwrap();
+        assert_eq!(memory.atomic_load_u32(rw_addr + 2), Err(MemoryFault));
+        assert_eq!(memory.atomic_load_u32(0x20_000), Err(MemoryFault));
+        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0));
+
+        // Discard leaves a zero-fill-on-demand page; atomic store commits a
+        // fresh frame and writes the word.
+        memory.discard(rw_addr, PhysFrame::SIZE as u64);
+        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0));
+        memory.atomic_store_u32(rw_addr, 0x1234_5678).unwrap();
+        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0x1234_5678));
+        assert_eq!(
+            memory.atomic_compare_exchange_u32(rw_addr, 9, 10),
+            Ok(Err(0x1234_5678))
+        );
+        assert_eq!(
+            memory.atomic_compare_exchange_u32(rw_addr, 0x1234_5678, 0xdead_beef),
+            Ok(Ok(0x1234_5678))
+        );
+        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0xdead_beef));
+
+        // Narrowing to read-only keeps atomic loads working and refuses atomic
+        // stores and CAS.
+        memory
+            .protect(rw_addr, PhysFrame::SIZE as u64, PageFlags::READ)
+            .unwrap();
+        assert_eq!(memory.atomic_load_u32(rw_addr), Ok(0xdead_beef));
+        assert_eq!(memory.atomic_store_u32(rw_addr, 1), Err(MemoryFault));
+        assert_eq!(
+            memory.atomic_compare_exchange_u32(rw_addr, 0xdead_beef, 1),
+            Err(MemoryFault)
+        );
+    }
 }

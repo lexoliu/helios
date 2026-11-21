@@ -947,6 +947,20 @@ mod linux_tests {
         fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
             Ok(())
         }
+        fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
+            Ok(0)
+        }
+        fn atomic_store_u32(&self, _: VirtAddr, _: u32) -> Result<(), NativeError> {
+            Ok(())
+        }
+        fn atomic_compare_exchange_u32(
+            &self,
+            _: VirtAddr,
+            expected: u32,
+            _: u32,
+        ) -> Result<Result<u32, u32>, NativeError> {
+            Ok(Ok(expected))
+        }
         fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
             Ok(())
         }
@@ -1011,6 +1025,15 @@ mod linux_tests {
         fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError> {
             self.tp = address;
             Ok(())
+        }
+
+        fn try_clone(&self) -> Result<Self, NativeError> {
+            Ok(Self {
+                behavior: self.behavior,
+                step: AtomicUsize::new(self.step.load(AtomicOrdering::Relaxed)),
+                result: self.result,
+                tp: self.tp,
+            })
         }
 
         fn resume(&mut self, _: &MockSpace) -> Stop {
@@ -1203,6 +1226,9 @@ mod linux_tests {
         let timeline = phases::Timeline::begin(&cpu, "spawn", "/linux/mock");
         let argv = ProgramArgv::launched("mock", Vec::new());
 
+        let instance_spawner = executor
+            .spawner(cpu.clone())
+            .instance_spawner(crate::TaskFunding::Instance, &instance);
         let mut fut = core::pin::pin!(run_linux_process(
             exec_context,
             argv,
@@ -1210,6 +1236,7 @@ mod linux_tests {
             ProcessAuthority::root(),
             None,
             signal_state.clone(),
+            instance_spawner,
             instance,
             output_mode,
             executable,

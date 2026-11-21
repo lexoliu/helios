@@ -6,7 +6,7 @@ publish = false
 
 [features]
 default = []
-runtime = ["dep:helios-sync", "helios-sync/runtime", "dep:bytes", "dep:helios-hal", "dep:helios-unix", "helios-unix/runtime", "dep:object", "dep:thiserror"]
+runtime = ["dep:helios-sync", "helios-sync/runtime", "dep:bytes", "dep:helios-hal", "dep:helios-unix", "helios-unix/runtime", "dep:object", "dep:spin", "dep:thiserror"]
 
 [dependencies]
 helios-hal = { workspace = true, optional = true }
@@ -14,6 +14,7 @@ helios-sync = { workspace = true, optional = true }
 bytes = { version = "1.12.1", default-features = false, optional = true }
 helios-unix = { workspace = true, optional = true }
 object = { version = "0.39.1", default-features = false, features = ["read_core", "elf"], optional = true }
+spin = { version = "0.9.9", default-features = false, features = ["mutex", "spin_mutex"], optional = true }
 thiserror = { version = "2.0.21", default-features = false, optional = true }
 
 [dev-dependencies]

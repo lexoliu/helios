@@ -38,9 +38,20 @@ pub trait System {
     /// process's authority lacks the right to set the wall clock.
     fn set_realtime_nanos(&mut self, nanos: u64) -> Result<(), Denied>;
 
-    /// Nanoseconds the process's thread has been executing: what
-    /// `CLOCK_PROCESS_CPUTIME_ID` and `CLOCK_THREAD_CPUTIME_ID` read.
+    /// Nanoseconds the calling thread has been executing: what
+    /// `CLOCK_THREAD_CPUTIME_ID` reads.
     fn cpu_nanos(&self) -> u64;
+
+    /// Nanoseconds every thread of the process has been executing: what
+    /// `CLOCK_PROCESS_CPUTIME_ID` reads.
+    fn process_cpu_nanos(&self) -> u64 {
+        self.cpu_nanos()
+    }
+
+    /// Online processors available to this process (`sched_getaffinity`).
+    fn processor_count(&self) -> u32 {
+        1
+    }
 
     /// Fills `output` from the kernel's entropy. Never blocks: the pool is
     /// seeded before any process starts.
@@ -179,7 +190,7 @@ pub struct Credentials {
 }
 
 /// What a process starts with that its launcher decides.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Start {
     pub credentials: Credentials,
     /// The machine's memory, which sizes `RLIMIT_NPROC` and
@@ -188,6 +199,8 @@ pub struct Start {
     /// The highest hard `RLIMIT_NOFILE` a process may set: the operator's
     /// `fs.nr_open`.
     pub open_files_ceiling: u64,
+    /// Shared futex wait table for this process's address space.
+    pub futex: helios_unix::FutexTable,
 }
 
 impl Default for Start {
@@ -196,6 +209,7 @@ impl Default for Start {
             credentials: Credentials::default(),
             memory_bytes: 0,
             open_files_ceiling: NR_OPEN_DEFAULT,
+            futex: helios_unix::FutexTable::new(),
         }
     }
 }
@@ -274,9 +288,9 @@ impl<R: Resources> Process<R> {
     /// descriptor table's own limit, so a table whose owner sets it and a
     /// program that sets it through a call agree.
     pub fn limit(&self, resource: Resource) -> Rlimit {
-        let mut limit = self.attributes.values[resource as usize];
+        let mut limit = self.shared.attributes.lock().values[resource as usize];
         if resource == Resource::Nofile {
-            limit.current = self.descriptors.limit.get() as u64;
+            limit.current = self.shared.descriptors.lock().limit.get() as u64;
         }
         limit
     }
@@ -284,12 +298,16 @@ impl<R: Resources> Process<R> {
     /// kernel/sys.c `do_prlimit`: the old limit, after `new` replaced it.
     fn set_limit(&mut self, resource: u32, new: Option<Rlimit>) -> Result<Rlimit, u64> {
         let resource = Resource::from_number(resource).ok_or(EINVAL)?;
-        let old = self.limit(resource);
+        let mut attributes = self.shared.attributes.lock();
+        let mut old = attributes.values[resource as usize];
+        if resource == Resource::Nofile {
+            old.current = self.shared.descriptors.lock().limit.get() as u64;
+        }
         let Some(new) = new else { return Ok(old) };
         if new.current > new.maximum {
             return Err(EINVAL);
         }
-        if resource == Resource::Nofile && new.maximum > self.attributes.open_files_ceiling {
+        if resource == Resource::Nofile && new.maximum > attributes.open_files_ceiling {
             return Err(EPERM);
         }
         // Raising a hard limit is `CAP_SYS_RESOURCE`'s, which no right of a
@@ -298,18 +316,22 @@ impl<R: Resources> Process<R> {
         if new.maximum > old.maximum {
             return Err(EPERM);
         }
-        self.attributes.values[resource as usize] = new;
+        attributes.values[resource as usize] = new;
         if resource == Resource::Nofile {
             // The soft value is the table's; bounded by the ceiling above.
-            self.descriptors.limit = DescriptorLimit::new(new.current as usize);
+            self.shared.descriptors.lock().limit = DescriptorLimit::new(new.current as usize);
         }
         Ok(old)
     }
 
-    /// Whether `pid` names this process: 0 is the caller. No other process
-    /// is visible to a Linux process yet.
+    /// Whether `pid` names this process or one of its threads: 0 is the
+    /// caller.
     fn names_self(&self, pid: i32) -> bool {
-        pid == 0 || u64::try_from(pid).is_ok_and(|pid| pid == self.identity.id().get())
+        pid == 0
+            || u64::try_from(pid).is_ok_and(|pid| {
+                pid == self.shared.identity.id().get()
+                    || u32::try_from(pid).is_ok_and(|tid| self.shared.threads.lock().contains(tid))
+            })
     }
 }
 
@@ -338,7 +360,8 @@ fn write_result<M: UserMemory>(memory: &mut M, address: u64, bytes: &[u8]) -> u6
 enum ClockSource {
     Realtime,
     Monotonic,
-    CpuTime,
+    ProcessCpuTime,
+    ThreadCpuTime,
 }
 
 fn clock_source(id: u64) -> Option<ClockSource> {
@@ -346,7 +369,8 @@ fn clock_source(id: u64) -> Option<ClockSource> {
     match id as u32 as i32 {
         0 | 5 | 11 => Some(ClockSource::Realtime), // REALTIME, REALTIME_COARSE, TAI
         1 | 4 | 6 | 7 => Some(ClockSource::Monotonic), // MONOTONIC, _RAW, _COARSE, BOOTTIME
-        2 | 3 => Some(ClockSource::CpuTime),       // PROCESS_/THREAD_CPUTIME_ID
+        2 => Some(ClockSource::ProcessCpuTime),    // PROCESS_CPUTIME_ID
+        3 => Some(ClockSource::ThreadCpuTime),     // THREAD_CPUTIME_ID
         _ => None,
     }
 }
@@ -362,7 +386,8 @@ pub(super) fn clock_gettime<M: UserMemory, O: Clock + System>(
         // which is zero until something sets it, and nothing here does.
         Some(ClockSource::Realtime) => output.realtime_nanos(),
         Some(ClockSource::Monotonic) => output.now_nanos(),
-        Some(ClockSource::CpuTime) => output.cpu_nanos(),
+        Some(ClockSource::ProcessCpuTime) => output.process_cpu_nanos(),
+        Some(ClockSource::ThreadCpuTime) => output.cpu_nanos(),
     };
     write_result(memory, args[1], &timespec(nanos))
 }
@@ -446,7 +471,7 @@ pub(super) fn time<M: UserMemory, O: System>(args: [u64; 6], memory: &mut M, out
 
 /// Yields to the executor once, so a long call does not hold its processor
 /// the way Linux's `cond_resched` keeps a long `getrandom` from doing.
-async fn yield_now() {
+pub(super) async fn yield_now() {
     let mut yielded = false;
     poll_fn(|cx| {
         if yielded {
@@ -670,8 +695,9 @@ impl<R: Resources> Process<R> {
     /// kernel/sys.c `umask`: the previous mask, bits above the permission
     /// bits dropped from the new one.
     pub(super) fn umask(&mut self, args: [u64; 6]) -> u64 {
-        let old = self.attributes.umask;
-        self.attributes.umask = args[0] as u32 & 0o777;
+        let mut attributes = self.shared.attributes.lock();
+        let old = attributes.umask;
+        attributes.umask = args[0] as u32 & 0o777;
         u64::from(old)
     }
 
@@ -683,7 +709,7 @@ impl<R: Resources> Process<R> {
         match which {
             0 => self.names_self(who),
             1 => who == 0,
-            _ => who == 0 || who as u32 == self.attributes.credentials.user.real,
+            _ => who == 0 || who as u32 == self.shared.attributes.lock().credentials.user.real,
         }
     }
 
@@ -696,7 +722,7 @@ impl<R: Resources> Process<R> {
         if !self.priority_target(which, who) {
             return errno(ESRCH);
         }
-        nice_to_rlimit(self.attributes.nice)
+        nice_to_rlimit(self.shared.attributes.lock().nice)
     }
 
     /// kernel/sys.c `setpriority`. Lowering the nice value passes the
@@ -713,11 +739,12 @@ impl<R: Resources> Process<R> {
         if !self.priority_target(which, who) {
             return errno(ESRCH);
         }
-        let allowed = self.limit(Resource::Nice).current;
-        if nice < self.attributes.nice && nice_to_rlimit(nice) > allowed {
+        let mut attributes = self.shared.attributes.lock();
+        let allowed = attributes.values[Resource::Nice as usize].current;
+        if nice < attributes.nice && nice_to_rlimit(nice) > allowed {
             return errno(EACCES);
         }
-        self.attributes.nice = nice;
+        attributes.nice = nice;
         0
     }
 }

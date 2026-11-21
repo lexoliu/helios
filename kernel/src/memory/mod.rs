@@ -89,6 +89,8 @@ pub use swap::{
 };
 #[cfg(test)]
 pub(crate) use swap::{GUEST_SWAP_PAGE, GuestSwap};
+#[cfg(test)]
+pub(crate) use user::installed_user_memory_pool;
 pub use user::{
     MemoryNodeStats, UserHeapStats, UserMemoryPool, allocate_user_frame_uninit_on,
     allocate_user_frame_uninit_on_node, allocate_user_frame_zeroed, allocate_user_frame_zeroed_on,

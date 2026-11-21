@@ -301,6 +301,29 @@ pub unsafe trait UserSpace: Send + Sync + 'static {
     /// whole length; nothing is written otherwise.
     fn write(&self, address: VirtAddr, bytes: &[u8]) -> Result<(), NativeError>;
 
+    /// Atomically loads the 32-bit little-endian word at the 4-byte-aligned
+    /// `address`, coherent with user-mode atomic operations on every
+    /// processor. Fails with [`NativeError::Address`] when `address` is
+    /// misaligned or outside the user range, and [`NativeError::NotMapped`]
+    /// when the page is not mapped readable.
+    fn atomic_load_u32(&self, address: VirtAddr) -> Result<u32, NativeError>;
+
+    /// Atomically stores `value` at the 4-byte-aligned `address`, committing a
+    /// discarded writable page first and coherent with user-mode atomic
+    /// operations on every processor.
+    fn atomic_store_u32(&self, address: VirtAddr, value: u32) -> Result<(), NativeError>;
+
+    /// Atomically compares the 32-bit word at the 4-byte-aligned `address`
+    /// with `expected` and, if equal, replaces it with `desired`, coherent
+    /// with user-mode atomic operations on every processor. Requires both
+    /// read and write access on the page.
+    fn atomic_compare_exchange_u32(
+        &self,
+        address: VirtAddr,
+        expected: u32,
+        desired: u32,
+    ) -> Result<Result<u32, u32>, NativeError>;
+
     /// Removes every mapped page of `range`, a page-aligned range inside
     /// the user range, and frees its frame once the shootdown completes.
     /// Pages of the range that are not mapped are skipped.
@@ -384,6 +407,13 @@ pub unsafe trait UserContext: Send + 'static {
     /// Replaces the thread pointer; refused outside the user range.
     fn set_thread_pointer(&mut self, address: VirtAddr) -> Result<(), NativeError>;
 
+    /// Duplicates the detached architectural snapshot (general, flags, thread
+    /// pointer, vector and extended state) into an independent context for a
+    /// new thread or child process.
+    fn try_clone(&self) -> Result<Self, NativeError>
+    where
+        Self: Sized;
+
     /// Runs one slice against `space`.
     fn resume(&mut self, space: &Self::Space) -> Stop;
 }
@@ -422,6 +452,20 @@ unsafe impl UserSpace for Infallible {
     fn write(&self, _: VirtAddr, _: &[u8]) -> Result<(), NativeError> {
         match *self {}
     }
+    fn atomic_load_u32(&self, _: VirtAddr) -> Result<u32, NativeError> {
+        match *self {}
+    }
+    fn atomic_store_u32(&self, _: VirtAddr, _: u32) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn atomic_compare_exchange_u32(
+        &self,
+        _: VirtAddr,
+        _: u32,
+        _: u32,
+    ) -> Result<Result<u32, u32>, NativeError> {
+        match *self {}
+    }
     fn unmap(&self, _: VirtRange) -> Result<(), NativeError> {
         match *self {}
     }
@@ -434,7 +478,8 @@ unsafe impl UserSpace for Infallible {
     fn remap(&self, _: VirtRange, _: VirtRange) -> Result<(), NativeError> {
         match *self {}
     }
-    fn resolve_fault(&self, _: VirtAddr, _: PageFlags) -> Result<(), NativeError> {
+    fn resolve_fault(&self, _: VirtAddr, access: PageFlags) -> Result<(), NativeError> {
+        let _ = access;
         match *self {}
     }
     fn mapping(&self, _: VirtRange) -> Option<Mapping> {
@@ -458,6 +503,9 @@ unsafe impl UserContext for Infallible {
         match *self {}
     }
     fn set_thread_pointer(&mut self, _: VirtAddr) -> Result<(), NativeError> {
+        match *self {}
+    }
+    fn try_clone(&self) -> Result<Self, NativeError> {
         match *self {}
     }
     fn resume(&mut self, _: &Self) -> Stop {
